@@ -40,7 +40,7 @@ groups:
         annotations:
           summary: "ababawa API: p95 задержки выше 1 с"
           description: >-
-            p95 за 5 минут — {{ $value | humanize_duration }}. Типовые причины:
+            p95 за 5 минут — {{ $value | humanizeDuration }}. Типовые причины:
             медленные запросы к PostgreSQL, нехватка CPU, GC-паузы.
 
       - alert: AbabawaJvmHeapHigh
@@ -71,7 +71,7 @@ groups:
         annotations:
           summary: "ababawa API: средняя пауза GC выше 0,5 с"
           description: >-
-            Средняя пауза — {{ $value | humanize_duration }}. Такие паузы заметны
+            Средняя пауза — {{ $value | humanizeDuration }}. Такие паузы заметны
             пользователю (подвисания чата и WebSocket).
 
       - alert: AbabawaDbDown
@@ -113,7 +113,7 @@ groups:
         annotations:
           summary: "ababawa: транзакция длится больше 10 минут"
           description: >-
-            Самая долгая транзакция — {{ $value | humanize_duration }}. Такая
+            Самая долгая транзакция — {{ $value | humanizeDuration }}. Такая
             транзакция держит bloat, мешает VACUUM и может блокировать записи.
 
       - alert: AbabawaDbDeadlocks

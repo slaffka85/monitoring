@@ -41,7 +41,7 @@ groups:
           summary: "Группа правил {{ $labels.rule_group }} считается дольше 5 с"
           description: >-
             Проверка правил {{ $labels.rule_group }} занимает
-            {{ $value | humanize_duration }}. Такие правила нагружают Prometheus
+            {{ $value | humanizeDuration }}. Такие правила нагружают Prometheus
             и могут отставать от реального времени.
 
       - alert: HostDiskSpaceLow

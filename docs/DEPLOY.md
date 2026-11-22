@@ -198,34 +198,34 @@ curl -s http://127.0.0.1:9090/api/v1/rules | head -c 300      # правила �
 
 ## Шаг 7. Включить метрики TURN (опционально)
 
-Сейчас в `/opt/abavava/compose.prod.yaml` у coturn **нет** `--prometheus`,
-поэтому метрики TURN не собираются, а файл цели лежит заготовкой
-`prometheus/targets/turn/ababawa.yml.example` (Prometheus читает только `*.yml`).
+Сейчас в `compose.prod.yaml` abavava у coturn **нет** `--prometheus`, поэтому
+метрики TURN не собираются: файл цели лежит заготовкой
+(`prometheus/targets/turn/ababawa.yml.example`), а джоба `turn` в
+`prometheus/prometheus.yml` закомментирована.
 
-Если метрики звонков нужны:
+Порядок (правки — **в репозиториях**, а не на VPS: CI перезаписывает конфиги
+целиком, ручные правки на сервере он затрёт):
 
-```yaml
-# /opt/abavava/compose.prod.yaml, сервис coturn, в command:
-      - --prometheus
-      # если сборка поддерживает флаг — не выставлять порт наружу:
-      - --prometheus-address=127.0.0.1
-```
+1. abavava, `compose.prod.yaml`, сервис `coturn`, в `command`:
 
-Дальше на VPS:
+   ```yaml
+         - --prometheus
+         # если сборка поддерживает флаг — не выставлять порт наружу:
+         - --prometheus-address=127.0.0.1
+   ```
 
-```bash
-# 1. применить изменения coturn (правку лучше делать в репозитории abavava)
-cd /opt/abavava && docker compose --env-file .env.production --env-file .deploy.env \
-  -f compose.prod.yaml up -d coturn
-curl -s http://127.0.0.1:9641/metrics | head -5
+   запушить и дождаться выкатки (или применить локально на VPS:
+   `cd /opt/abavava && docker compose … up -d coturn`), проверить
+   `curl -s http://127.0.0.1:9641/metrics | head -5`;
 
-# 2. включить цель
-cd /opt/monitoring
-mv prometheus/targets/turn/ababawa.yml.example prometheus/targets/turn/ababawa.yml
-# Prometheus подхватит файл за минуту (file_sd), перезапуск не нужен
-```
+2. monitoring: переименовать `prometheus/targets/turn/ababawa.yml.example` →
+   `prometheus/targets/turn/ababawa.yml` и раскомментировать джобу `turn` в
+   `prometheus/prometheus.yml`;
 
-Проверка: `up{job="turn"}` = 1, панели «TURN: …» в дашборде оживают.
+3. запушить `monitoring` — CI разложит файлы и пересоздаст Prometheus, джоба
+   начнётся сразу.
+
+Проверка: `up{job="turn"} = 1`, панели «TURN: …» в дашборде оживают.
 
 Безопасность: без `--prometheus-address` coturn слушает `0.0.0.0:9641`, то есть
 метрики доступны из интернета. Проверить и при необходимости закрыть:

@@ -65,14 +65,17 @@ VPS (Linux)
 (Prometheus читает только `*.yml`, так что она игнорируется и `TargetDown` не
 шумит).
 
-Включить (нужна правка в репозитории abavava):
+Включить (нужны правки в обоих репозиториях):
 
-1. в команду сервиса `coturn` добавить `- --prometheus`; если сборка
-   поддерживает `--prometheus-address`, добавить и `- --prometheus-address=127.0.0.1`
-   — без него coturn слушает **все интерфейсы** на `:9641`;
+1. в репозитории abavava в команду сервиса `coturn` добавить `- --prometheus`;
+   если сборка поддерживает `--prometheus-address`, добавить и
+   `- --prometheus-address=127.0.0.1` — без него coturn слушает **все**
+   интерфейсы на `:9641`;
 2. выкатить abavava и проверить: `curl -s http://127.0.0.1:9641/metrics | head`;
-3. переименовать `targets/turn/ababawa.yml.example` → `ababawa.yml` (Prometheus
-   подхватит за минуту, перезапуск не нужен).
+3. в этом репозитории переименовать `prometheus/targets/turn/ababawa.yml.example`
+   → `ababawa.yml` и раскомментировать джобу `turn` в `prometheus/prometheus.yml`
+   (в закомментированном виде она не сыпет WARNING про пустой file_sd);
+4. запушить — CI разложит файлы и пересоздаст Prometheus.
 
 Если оставлять порт открытым нельзя, а метрики нужны — либо
 `--prometheus-address=127.0.0.1`, либо `sudo ufw deny 9641/tcp`.

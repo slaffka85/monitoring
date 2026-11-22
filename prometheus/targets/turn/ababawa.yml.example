@@ -13,7 +13,10 @@
 #      (без этого coturn слушает 0.0.0.0:9641 — закройте порт файрволом);
 #   2. выкатить abavava и убедиться: curl -s http://127.0.0.1:9641/metrics | head
 #   3. переименовать этот файл в ababawa.yml
-#   4. Prometheus подхватит цель в течение минуты (file_sd), перезапуск не нужен.
+#   4. раскомментировать джобу `turn` в prometheus/prometheus.yml (она
+#      закомментирована, чтобы включённая джоба без файлов не сыпала WARNING
+#      «file_sd ... does not exist») и применить конфиг: Prometheus сам
+#      подхватит цель в течение минуты.
 #
 # Метрики coturn (см. src/apps/relay/prom_server.c):
 #   turn_total_allocations{type,protocol,family} — живые аллокации (сессии)
