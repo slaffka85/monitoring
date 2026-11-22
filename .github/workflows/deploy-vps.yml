@@ -3,7 +3,7 @@ name: Validate and deploy to VPS
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, fix-deployment]
   workflow_dispatch:
 
 permissions:
