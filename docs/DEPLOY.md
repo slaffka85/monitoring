@@ -21,7 +21,6 @@ export VPS_USER=deploy
 ```bash
 docker compose version            # v2.x
 docker ps --format '{{.Names}}'   # abavava-api-1, abavava-web-1, abavava-postgres-1, abavava-coturn-1
-docker network ls | grep abavava  # abavava_default — к ней подключится postgres_exporter
 ```
 
 Порты стека должны быть свободны (все — loopback):
@@ -30,18 +29,20 @@ docker network ls | grep abavava  # abavava_default — к ней подключ
 ss -ltn | grep -E ':(9090|9093|3001|9100|8088|9187)\b' || echo 'порты свободны'
 ```
 
-Что должно отвечать до первого запуска:
+Что должно отвечать до первого запуска (это те цели, которые будет скрейпить
+Prometheus):
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18082/healthz   # 200 — api ababawa
+curl -s -o /dev/null -w 'api      %{http_code}\n' http://127.0.0.1:18082/healthz        # 200
+curl -s -o /dev/null -w 'coturn   %{http_code}\n' http://127.0.0.1:9641/metrics         # 200
+ss -ltn | grep -q '127.0.0.1:5432' && echo 'postgres ok' || echo 'postgres НЕ опубликован'
 ```
 
-Postgres отдельно проверять не нужно: он не публикуется на хост, к нему ходит
-только `postgres_exporter` изнутри сети `abavava_default` (шаг 4).
-
-Метрики TURN опциональны: в текущем `/opt/abavava/compose.prod.yaml` у coturn
-нет флага `--prometheus`, поэтому `curl 127.0.0.1:9641` ничего не вернёт, а файл
-цели лежит заготовкой. Как включить — [шаг 7](#шаг-7-включить-метрики-turn-опционально).
+`127.0.0.1:5432` в abavava публикуется сервисом `postgres`
+(`"127.0.0.1:5432:5432"`), `9641` открывает coturn с флагом `--prometheus`.
+Если postgres не опубликован — `postgres_exporter` не сможет подключиться;
+вариант решения — подключить экспортёр к docker-сети проекта
+(`docs/ADD-PROJECT.md`, раздел «Ограничения»).
 
 ## Шаг 1. Каталог на VPS (один раз, от root)
 
@@ -103,14 +104,15 @@ git push origin main
 
 Вариант Б — руками, если CI недоступен: см. [Ручной деплой](#ручной-деплой-без-github-actions).
 
-Промежуточный итог первого деплоя:
+Промежуточный итог первого деплоя (7 целей: `prometheus`, `alertmanager`,
+`node`, `cadvisor`, `postgres`, `turn`, `api`):
 
 * `prometheus`, `alertmanager`, `grafana`, `node-exporter`, `cadvisor` — `up`;
-* `api` — цель `down`: в текущем образе ababawa ещё нет `/actuator/prometheus`
-  (лечится шагом 5);
-* `postgres-exporter` — живёт, но без роли БД перезапускается и отдаёт `pg_up 0`
+* `turn` — `up` (coturn с `--prometheus` уже работает в проде);
+* `postgres` — цель `up`, но `pg_up 0`: экспортёру ещё нет роли БД
   (лечится шагом 4);
-* `turn` — цели нет вовсе, метрики TURN выключены (шаг 7, опционально).
+* `api` — `down`: в текущем образе ababawa нет `/actuator/prometheus`
+  (лечится шагом 5).
 
 ## Шаг 4. Роль БД для postgres_exporter
 
@@ -176,10 +178,10 @@ docker compose ps                                  # все running
 curl -s http://127.0.0.1:9090/-/ready              # Prometheus Server is Ready.
 curl -s http://127.0.0.1:3001/api/health           # {"database":"ok",...}
 
-# цели: prometheus, alertmanager, node, cadvisor, postgres, api
+# цели: prometheus, alertmanager, node, cadvisor, postgres, turn, api
 curl -s http://127.0.0.1:9090/api/v1/targets \
   | grep -o '"health":"[a-z]*"' | sort | uniq -c
-# 5 "health":"up"     ← после шага 4
+# 6 "health":"up"     ← после шага 4 (turn поднимается сразу)
 # 1 "health":"down"   ← api, пока не выполнен шаг 5
 # подробности по каждой цели: http://127.0.0.1:9090/targets (через туннель)
 
@@ -190,49 +192,37 @@ curl -s http://127.0.0.1:9090/api/v1/rules | head -c 300      # правила �
 Чек-лист:
 
 - [ ] `docker compose ps` — 6 сервисов `running`
-- [ ] цели `up`, кроме ещё не развёрнутых (`api` до шага 5, `turn` — опционально)
+- [ ] цели `up`, кроме `api` (до шага 5)
 - [ ] `pg_up 1` на `127.0.0.1:9187/metrics`
 - [ ] `curl 127.0.0.1:18082/actuator/prometheus` отдаёт метрики
 - [ ] в Prometheus `/alerts` нет `TargetDown`
 - [ ] в Grafana открывается дашборд «ababawa / Overview» без ошибок запросов
+- [ ] панели «TURN: …» показывают данные (в проде уже есть `--prometheus`)
 
-## Шаг 7. Включить метрики TURN (опционально)
+## Шаг 7. Проверить порт метрик TURN
 
-Сейчас в `compose.prod.yaml` abavava у coturn **нет** `--prometheus`, поэтому
-метрики TURN не собираются: файл цели лежит заготовкой
-(`prometheus/targets/turn/ababawa.yml.example`), а джоба `turn` в
-`prometheus/prometheus.yml` закомментирована.
-
-Порядок (правки — **в репозиториях**, а не на VPS: CI перезаписывает конфиги
-целиком, ручные правки на сервере он затрёт):
-
-1. abavava, `compose.prod.yaml`, сервис `coturn`, в `command`:
-
-   ```yaml
-         - --prometheus
-         # если сборка поддерживает флаг — не выставлять порт наружу:
-         - --prometheus-address=127.0.0.1
-   ```
-
-   запушить и дождаться выкатки (или применить локально на VPS:
-   `cd /opt/abavava && docker compose … up -d coturn`), проверить
-   `curl -s http://127.0.0.1:9641/metrics | head -5`;
-
-2. monitoring: переименовать `prometheus/targets/turn/ababawa.yml.example` →
-   `prometheus/targets/turn/ababawa.yml` и раскомментировать джобу `turn` в
-   `prometheus/prometheus.yml`;
-
-3. запушить `monitoring` — CI разложит файлы и пересоздаст Prometheus, джоба
-   начнётся сразу.
-
-Проверка: `up{job="turn"} = 1`, панели «TURN: …» в дашборде оживают.
-
-Безопасность: без `--prometheus-address` coturn слушает `0.0.0.0:9641`, то есть
-метрики доступны из интернета. Проверить и при необходимости закрыть:
+Метрики TURN собираются сразу — coturn в проде уже запущен с `--prometheus`
+(образ `coturn/coturn:4.19.2`, `network_mode: host`). Единственное, что нужно
+проверить руками: **куда** слушает экспортёр. Без `--prometheus-address` он
+поднимается на всех интерфейсах:
 
 ```bash
-ss -ltnp | grep 9641                 # 0.0.0.0:9641 ?
-sudo ufw deny 9641/tcp
+ss -ltnp | grep 9641          # 0.0.0.0:9641 или 127.0.0.1:9641?
+curl -s http://127.0.0.1:9641/metrics | head -5
+```
+
+Если слушает `0.0.0.0` — закройте порт файрволом:
+
+```bash
+sudo ufw deny 9641/tcp        # или правило в security group провайдера
+```
+
+Либо (предпочтительнее) ограничить адрес в abavava — флаг поддержан в 4.19.2:
+
+```yaml
+# compose.prod.yaml, сервис coturn, в command:
+      - --prometheus
+      - --prometheus-address=127.0.0.1
 ```
 
 ## Доступ к панелям
@@ -309,12 +299,10 @@ docker compose up -d --remove-orphans --force-recreate
 |---|---|---|
 | `up{job="api"} = 0`, в `/targets` — 404 | на VPS старый образ ababawa без Actuator | шаг 5: закоммитить правки и дождаться деплоя |
 | `up{job="api"} = 0`, connection refused | api не слушает `127.0.0.1:18082` | `ss -ltnp` на VPS, `docker compose ps` в `/opt/abavava` |
-| `compose up`: `network abavava_default declared as external, but could not be found` | стек abavava не запущен или проект переименован | `docker network ls \| grep abavava`; при другом имени задать `ABABAWA_DOCKER_NETWORK` в `.env` |
-| `up{job="postgres"} = 0` | экспортёр не поднялся | `docker compose logs postgres-exporter`, роль БД и пароль в `.env` |
-| `pg_up 0` при `up{job="postgres"} = 1` | экспортёр жив, но не подключается к БД | пароль в `.env` ≠ пароль роли; сеть `abavava_default`; имя базы |
-| `up{job="turn"}` вообще нет в `/targets` | файл цели лежит как `.example` | шаг 7: включить `--prometheus` и переименовать файл |
-| `up{job="turn"} = 0` | coturn без `--prometheus` или занят 9641 | `ss -ltnp \| grep 9641`, проверить команду coturn |
-| Prometheus пишет `no files found matching` | не смонтирован каталог targets | проверить `docker compose config` и наличие `/opt/monitoring/prometheus/targets/*/` |
+| `up{job="postgres"} = 0` | экспортёр не поднялся | `docker compose logs postgres-exporter`, пароль в `.env` |
+| `pg_up 0` при `up{job="postgres"} = 1` | экспортёр жив, но не подключается к БД | роль не создана (шаг 4); пароль в `.env` ≠ пароль роли; порт `5432` не опубликован в abavava |
+| `up{job="turn"} = 0` | coturn без `--prometheus` или занят 9641 | `ss -ltnp \| grep 9641`, `docker logs abavava-coturn-1 \| grep -i prometheus` |
+| Prometheus пишет `no files found matching` | каталог targets пуст или не смонтирован | проверить `docker compose config` и `/opt/monitoring/prometheus/targets/*/` |
 | Grafana пустая, «datasource not found» | provisioning не применился | `docker compose logs grafana \| grep -i provision` |
 | `docker compose up` падает на `GRAFANA_ADMIN_PASSWORD` | `.env` не создан или пуст | записать `.env` (`umask 077`), права `600` |
 | cAdvisor падает: `/dev/kmsg: no such file` | усечённое ядро VPS | убрать `devices:` из сервиса `cadvisor` в `compose.yaml` |

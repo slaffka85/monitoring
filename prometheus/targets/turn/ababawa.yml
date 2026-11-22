@@ -1,0 +1,23 @@
+# Цель джобы `turn` для проекта ababawa (coturn).
+#
+# В abavava/compose.prod.yaml сервис coturn запущен с `--prometheus`
+# (образ coturn/coturn:4.19.2, network_mode: host) и отдаёт метрики на
+# :9641/metrics. Порт метрик по умолчанию НЕ привязан к loopback, поэтому
+# проверьте, что он не смотрит в интернет:
+#
+#   ss -ltnp | grep 9641                  # 0.0.0.0:9641 ?
+#   sudo ufw deny 9641/tcp                # если да — закрыть
+#   # либо в command coturn: --prometheus-address=127.0.0.1 (4.19.2 поддерживает)
+#
+# Метрики coturn (src/apps/relay/prom_server.c, тег 4.19.2):
+#   turn_total_allocations{type,protocol,family} — живые аллокации (сессии)
+#   turn_packet_processed / turn_packet_dropped  — пакеты в реальном времени
+#   turn_total_traffic_rcvb/sentb                — байты ТОЛЬКО завершённых сессий
+#   turn_auth_credential_failures{cause}         — отказы аутентификации
+#   stun_binding_request/response/error          — STUN-биндинги
+- targets:
+    - 127.0.0.1:9641
+  labels:
+    project: ababawa
+    component: turn
+    env: production

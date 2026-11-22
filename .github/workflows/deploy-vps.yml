@@ -119,7 +119,6 @@ jobs:
           GRAFANA_ROOT_URL: ${{ vars.GRAFANA_ROOT_URL || 'http://127.0.0.1:3001' }}
           ABABAWA_DB_MONITOR_USER: ${{ vars.ABABAWA_DB_MONITOR_USER || 'abv_monitor' }}
           ABABAWA_DB_MONITOR_PASSWORD: ${{ secrets.ABABAWA_DB_MONITOR_PASSWORD }}
-          ABABAWA_DOCKER_NETWORK: ${{ vars.ABABAWA_DOCKER_NETWORK || 'abavava_default' }}
         run: |
           printf '%s\n' \
             "GRAFANA_ADMIN_USER=$GRAFANA_ADMIN_USER" \
@@ -127,8 +126,9 @@ jobs:
             "GRAFANA_ROOT_URL=$GRAFANA_ROOT_URL" \
             "ABABAWA_DB_MONITOR_USER=$ABABAWA_DB_MONITOR_USER" \
             "ABABAWA_DB_MONITOR_PASSWORD=$ABABAWA_DB_MONITOR_PASSWORD" \
+            "ABABAWA_DB_HOST=127.0.0.1" \
+            "ABABAWA_DB_PORT=5432" \
             "ABABAWA_DB_NAME=abavava" \
-            "ABABAWA_DOCKER_NETWORK=$ABABAWA_DOCKER_NETWORK" \
             | ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
               'umask 077; cat > /opt/monitoring/.env'
 

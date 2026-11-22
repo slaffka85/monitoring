@@ -13,8 +13,8 @@ React-клиент, PostgreSQL и coturn для видеозвонков.
 | Источник | Что видно | Откуда данные |
 |---|---|---|
 | Java API ababawa | RPS, p95-задержка, доля 5xx, разбивка по статусам и эндпоинтам, JVM (heap, GC, потоки), пул HikariCP | `GET /actuator/prometheus` — Spring Boot Actuator + Micrometer, порт `127.0.0.1:18082` |
-| PostgreSQL | соединения и `max_connections`, размер БД, commit/rollback в секунду, buffer cache hit, долгие транзакции, блокировки, deadlock-и | `postgres-exporter` живёт в docker-сети ababava (постгрес на хост не публикуется), наружу для скрейпа — `127.0.0.1:9187` |
-| coturn (TURN) | живые аллокации (сессии) по протоколам, обработанные/отброшенные пакеты, байты завершённых сессий, отказы аутентификации | `127.0.0.1:9641/metrics` — **требует `--prometheus` в coturn**, сейчас в abavava флаг не включён, цель лежит заготовкой `targets/turn/ababawa.yml.example` |
+| PostgreSQL | соединения и `max_connections`, размер БД, commit/rollback в секунду, buffer cache hit, долгие транзакции, блокировки, deadlock-и | `postgres-exporter` на `127.0.0.1:9187`, БД — через опубликованный на loopback `127.0.0.1:5432` |
+| coturn (TURN) | живые аллокации (сессии) по протоколам, обработанные/отброшенные пакеты, байты завершённых сессий, отказы аутентификации | `127.0.0.1:9641/metrics` — в abavava coturn уже запущен с `--prometheus` (образ 4.19.2) |
 | Контейнеры | CPU и RAM по `abavava-api-1`, `-web-1`, `-postgres-1`, `-coturn-1` | `cAdvisor` на `127.0.0.1:8088` |
 | Хост VPS | загрузка CPU, занятая RAM, место на `/`, PSI-давление на память | `node-exporter` на `127.0.0.1:9100` |
 | Сам стек | `up` по всем целям, скорость вычисления правил, успешность reload | Prometheus `127.0.0.1:9090` |
@@ -28,15 +28,15 @@ React-клиент, PostgreSQL и coturn для видеозвонков.
 ```
 VPS (Linux)
 ├── /opt/abavava          прод ababawa (свой compose): api 127.0.0.1:18082,
-│                         web 127.0.0.1:18080, postgres — только внутри
-│                         docker-сети abavava_default, coturn 3478/udp
+│                         web 127.0.0.1:18080, postgres 127.0.0.1:5432,
+│                         coturn 3478/udp + метрики на :9641
 └── /opt/monitoring       этот репозиторий
     ├── prometheus        :9090  ← скрейпит всё перечисленное по loopback
     ├── alertmanager      :9093
     ├── grafana           :3001  ← панели
     ├── node-exporter     :9100
     ├── cadvisor          :8088
-    └── postgres-exporter :9187  ← внутри сети abavava, наружу только loopback
+    └── postgres-exporter :9187
 ```
 
 Сознательные решения:
@@ -44,12 +44,9 @@ VPS (Linux)
 * **`network_mode: host` и только loopback.** Все сервисы слушают `127.0.0.1`,
   поэтому снаружи панели недоступны без SSH-туннеля, порты не публикуются и не
   требуют правок файрвола. Docker-сеть между `abavava` и `monitoring` не нужна:
-  приложение уже публикует свои порты на loopback хоста.
-* **Исключение — `postgres_exporter`.** Прод-постгрес на хост не публикуется
-  (так задумано в abavava), поэтому экспортёр подключён к чужой сети
-  `abavava_default` как `external` и ходит в БД по DNS-имени `postgres`, а
-  наружу выставлен только `127.0.0.1:9187` для скрейпа. Следствие: стек
-  поднимается **после** ababava, иначе сети ещё нет и `compose up` упадёт.
+  приложение публикует свои порты на loopback хоста (`18082`, `5432`), а coturn
+  слушает `:9641` сам. Побочный плюс: стек мониторинга поднимается независимо
+  от того, жив ли прод — именно это от него и требуется.
 * **Цели проектов — через `file_sd`.** `prometheus/targets/<компонент>/<проект>.yml`
   перечитывается раз в минуту: цели можно менять без перезапуска Prometheus.
 * **Дашборды и алерты — как код.** JSON дашбордов и правила лежат в Git,
@@ -59,26 +56,22 @@ VPS (Linux)
   0.35.0, node-exporter 1.13.1, cAdvisor 0.61.1, postgres-exporter 0.21.1).
   Обновление — отдельный осознанный шаг, а не сюрприз при `pull`.
 
-Одна оговорка про TURN. Метрики coturn появляются только при флаге
-`--prometheus`, а в текущем `/opt/abavava/compose.prod.yaml` его нет — поэтому
-файл цели лежит заготовкой: `prometheus/targets/turn/ababawa.yml.example`
-(Prometheus читает только `*.yml`, так что она игнорируется и `TargetDown` не
-шумит).
+Одна оговорка про TURN: экспортёр coturn не подчиняется правилу «только
+loopback». По умолчанию (`--prometheus` без `--prometheus-address`) он слушает
+**все** интерфейсы на `:9641`. Скрейп по `127.0.0.1:9641` при этом работает, но
+порт стоит закрыть:
 
-Включить (нужны правки в обоих репозиториях):
+```bash
+ss -ltnp | grep 9641          # 0.0.0.0:9641 или 127.0.0.1:9641?
+```
 
-1. в репозитории abavava в команду сервиса `coturn` добавить `- --prometheus`;
-   если сборка поддерживает `--prometheus-address`, добавить и
-   `- --prometheus-address=127.0.0.1` — без него coturn слушает **все**
-   интерфейсы на `:9641`;
-2. выкатить abavava и проверить: `curl -s http://127.0.0.1:9641/metrics | head`;
-3. в этом репозитории переименовать `prometheus/targets/turn/ababawa.yml.example`
-   → `ababawa.yml` и раскомментировать джобу `turn` в `prometheus/prometheus.yml`
-   (в закомментированном виде она не сыпет WARNING про пустой file_sd);
-4. запушить — CI разложит файлы и пересоздаст Prometheus.
+Если открыт наружу — либо `sudo ufw deny 9641/tcp`, либо добавить в команду
+coturn (флаг поддержан в 4.19.2) и выкатить abavava:
 
-Если оставлять порт открытым нельзя, а метрики нужны — либо
-`--prometheus-address=127.0.0.1`, либо `sudo ufw deny 9641/tcp`.
+```yaml
+      - --prometheus
+      - --prometheus-address=127.0.0.1
+```
 
 ## Установка на VPS
 
@@ -158,17 +151,15 @@ docker compose ps
 ```bash
 curl -s http://127.0.0.1:9090/api/v1/targets \
   | grep -o '"health":"[a-z]*"' | sort | uniq -c
-# ожидаем up для postgres, node, cadvisor, prometheus, alertmanager;
-# api станет up после выкатки ababawa с Actuator (см. следующий раздел),
-# turn — только если включён --prometheus у coturn
+# ожидаем up для postgres, turn, node, cadvisor, prometheus, alertmanager;
+# api станет up после выкатки ababawa с Actuator (см. следующий раздел)
 
 curl -s 'http://127.0.0.1:9090/api/v1/label/project/values'
 # {"status":"success","data":["ababawa"]}
 ```
 
 `job="api"` будет `down`, пока на VPS не поедет образ ababawa с включённым
-Actuator. `job="turn"` по умолчанию отсутствует: файл цели лежит заготовкой
-(метрики TURN требуют флага `--prometheus`, см. выше).
+Actuator — это единственная цель, которая зависит от выкатки приложения.
 
 ## Что нужно со стороны ababawa
 
@@ -239,7 +230,7 @@ TLS и basic-auth, а не публикацией порта: Prometheus и Aler
 | `AbabawaDbConnectionsHigh` | >80% `max_connections` | пул приложения (`hikaricp_connections_*`), утечки соединений |
 | `AbabawaDbLongTransaction` | транзакция > 10 мин | `pg_stat_activity`, блокировки, bloat |
 | `AbabawaDbDeadlocks` | есть deadlock-и | искать в логах api пары операций, конфликтующих по строкам |
-| `AbabawaTurnAuthFailures` | TURN отклоняет креденшелы | только при включённых метриках TURN: `GET /api/v1/config/ice`, `ABV_TURN_*` в `/opt/abavava/.deploy.env`; симптом — звонок «идёт», медиа нет |
+| `AbabawaTurnAuthFailures` | TURN отклоняет креденшелы | `GET /api/v1/config/ice`, `ABV_TURN_*` в `/opt/abavava/.deploy.env`; симптом — звонок «идёт», медиа нет |
 | `HostDiskSpaceLow` | <15% на `/` | чистка образов (`docker image prune`), ретеншен Prometheus |
 | `HostMemoryPressureHigh` | PSI memory > 20% | `docker stats`; кандидат на OOM-kill |
 

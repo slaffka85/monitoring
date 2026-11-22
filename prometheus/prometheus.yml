@@ -85,23 +85,17 @@ scrape_configs:
           - /etc/prometheus/targets/postgres/*.yml
         refresh_interval: 1m
 
-  # --- Метрики TURN (выключены) ----------------------------------------------
-  # coturn отдаёт 127.0.0.1:9641/metrics только при флаге --prometheus, а в
-  # текущем compose.prod.yaml abavava его нет. Поэтому и джоба, и файл цели
-  # закомментированы/переименованы: включённая джоба без файлов даёт WARNING
-  # «file_sd ... does not exist» при каждой проверке конфига.
-  #
-  # Включение (см. docs/DEPLOY.md, шаг 7):
-  #   1) добавить - --prometheus в command сервиса coturn в abavava и выкатить;
-  #   2) mv targets/turn/ababawa.yml.example targets/turn/ababawa.yml;
-  #   3) раскомментировать блок ниже и применить конфиг (POST /-/reload).
-  #
-  # - job_name: turn
-  #   scrape_interval: 30s
-  #   file_sd_configs:
-  #     - files:
-  #         - /etc/prometheus/targets/turn/*.yml
-  #       refresh_interval: 1m
+  # --- Метрики TURN ----------------------------------------------------------
+  # coturn запущен с --prometheus (compose.prod.yaml abavava, образ 4.19.2) и
+  # отдаёт метрики на :9641/metrics. Внимание: без --prometheus-address он
+  # слушает ВСЕ интерфейсы, поэтому порт 9641/tcp не должен смотреть в интернет
+  # (проверка — в README).
+  - job_name: turn
+    scrape_interval: 30s
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/targets/turn/*.yml
+        refresh_interval: 1m
 
   # --- Заготовки на будущее --------------------------------------------------
   # Внешние проверки (доступность домена, TLS-сертификат, редиректы) требуют

@@ -136,29 +136,25 @@ services:
     logging: *default-logging
 
   # --- Метрики PostgreSQL ababawa --------------------------------------------
-  # Постгрес прод-стека намеренно НЕ публикует порт на хост (в
-  # /opt/abavava/compose.prod.yaml у сервиса postgres нет ports), поэтому
-  # подключаемся к нему изнутри docker-сети проекта: сеть abavava_default
-  # объявлена external. Снаружи экспортёр виден только на loopback хоста, чтобы
-  # Prometheus (host network) мог его скрейпить.
+  # Прод-постгрес публикуется только на loopback хоста
+  # (127.0.0.1:5432 в compose.prod.yaml abavava), поэтому подключаемся как
+  # обычная host-network цель: без docker-сетей и без зависимости от того, что
+  # стек abavava поднят в момент старта monitoring.
   #
-  # Следствие: сеть должна существовать — monitoring поднимается ПОСЛЕ abavava.
-  # Имя сети = <project>_<network>; если проект переименуют, задайте
-  # ABABAWA_DOCKER_NETWORK в .env.
+  # Если в abavava уберут публикацию порта, сработает алерт AbabawaDbDown:
+  # тогда экспортёра нужно подключить к сети проекта (вариант описан в
+  # docs/ADD-PROJECT.md). Права роли — postgres/monitor-role.sql (шаг 4 в README).
   postgres-exporter:
     image: prometheuscommunity/postgres-exporter:v0.21.1
     container_name: monitoring-postgres-exporter
-    networks:
-      - ababava
-    ports:
-      - "127.0.0.1:9187:9187"
+    network_mode: host
     environment:
-      # postgres — DNS-имя сервиса внутри сети abavava.
-      DATA_SOURCE_URI: postgresql://postgres:5432/${ABABAWA_DB_NAME:-abavava}?sslmode=disable
+      DATA_SOURCE_URI: postgresql://${ABABAWA_DB_HOST:-127.0.0.1}:${ABABAWA_DB_PORT:-5432}/${ABABAWA_DB_NAME:-abavava}?sslmode=disable
       DATA_SOURCE_USER: ${ABABAWA_DB_MONITOR_USER:-abv_monitor}
       DATA_SOURCE_PASS: ${ABABAWA_DB_MONITOR_PASSWORD:?Set ABABAWA_DB_MONITOR_PASSWORD in .env}
       # Метрики всех баз на сервере, а не только той, что в DSN.
       PG_EXPORTER_AUTO_DISCOVER_DATABASES: "true"
+      PG_EXPORTER_WEB_LISTEN_ADDRESS: 127.0.0.1:9187
     restart: unless-stopped
     logging: *default-logging
 
@@ -166,8 +162,3 @@ volumes:
   prometheus_data:
   alertmanager_data:
   grafana_data:
-
-networks:
-  ababava:
-    external: true
-    name: ${ABABAWA_DOCKER_NETWORK:-abavava_default}
