@@ -1,0 +1,14 @@
+# Цель джобы `api` (см. prometheus.yml) для проекта ababawa.
+#
+# 18082 — порт контейнера api, опубликованный на loopback хоста
+# (compose.prod.yaml в репозитории abavava: "127.0.0.1:18082:8082").
+# Метрики отдаёт Spring Boot Actuator (/actuator/prometheus); путь задан в джобе.
+#
+# Метка project попадает в каждый ряд и используется в дашбордах и алертах,
+# поэтому имя проекта должно совпадать с остальными файлами targets/*/ababawa.yml.
+- targets:
+    - 127.0.0.1:18082
+  labels:
+    project: ababawa
+    component: api
+    env: production

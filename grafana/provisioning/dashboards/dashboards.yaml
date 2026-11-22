@@ -1,0 +1,18 @@
+apiVersion: 1
+
+# Провайдер дашбордов: Grafana читает JSON из /var/lib/grafana/dashboards
+# (в контейнере это смонтированный ./grafana/dashboards) и обновляет их при
+# изменении файла — правки в Git попадают в UI без ручного импорта.
+providers:
+  - name: ababawa
+    orgId: 1
+    folder: Ababawa
+    folderUid: ababawa
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    # Правки в UI не сохраняются: единственный источник правды — файлы в Git.
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

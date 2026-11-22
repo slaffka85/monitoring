@@ -1,0 +1,73 @@
+# =============================================================================
+# Общие алерты стека: применимы к любому подключённому проекту.
+# Проверка синтаксиса: promtool check rules prometheus/rules/*.yml
+# =============================================================================
+groups:
+  - name: platform
+    rules:
+      # Единственный «фундамент»: любая цель, которую Prometheus не может
+      # опросить, шумит здесь. Проектные алерты ниже добавляют смысл («что
+      # именно легло»), но не дублируют проверку доступности.
+      - alert: TargetDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Цель {{ $labels.job }} недоступна"
+          description: >-
+            Prometheus не может опросить {{ $labels.instance }}
+            (job={{ $labels.job }}, project={{ $labels.project }}) более 2 минут.
+            Проверьте контейнер и порт на VPS: docker compose ps, ss -ltnp.
+
+      - alert: PrometheusConfigReloadFailed
+        expr: prometheus_config_last_reload_successful == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus не может применить конфигурацию"
+          description: >-
+            Последняя перезагрузка конфигурации завершилась ошибкой (метрика
+            prometheus_config_last_reload_successful=0). Правьте
+            config/rules/targets и перезагружайте POST /-/reload до устранения.
+
+      - alert: PrometheusRuleEvaluationTooSlow
+        expr: prometheus_rule_group_last_duration_seconds > 5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Группа правил {{ $labels.rule_group }} считается дольше 5 с"
+          description: >-
+            Проверка правил {{ $labels.rule_group }} занимает
+            {{ $value | humanize_duration }}. Такие правила нагружают Prometheus
+            и могут отставать от реального времени.
+
+      - alert: HostDiskSpaceLow
+        # Без фильтра по fstype: если корень смонтирован нестандартно (overlay,
+        # zfs), фильтр молча убрал бы единственный нужный ряд.
+        expr: >-
+          node_filesystem_avail_bytes{job="node",mountpoint="/"}
+          / node_filesystem_size_bytes{job="node",mountpoint="/"}
+          < 0.15
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Мало места на диске VPS"
+          description: >-
+            Свободно {{ $value | humanizePercentage }} корневой ФС.
+            Prometheus держит до 2 ГБ метрик, PostgreSQL растёт вместе с чатом.
+
+      - alert: HostMemoryPressureHigh
+        expr: rate(node_pressure_memory_waiting_seconds_total{job="node"}[5m]) > 0.2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "VPS ждёт память (PSI)"
+          description: >-
+            Доля времени, когда задачи простаивали из-за нехватки памяти:
+            {{ $value | humanizePercentage }}. Кандидат на OOM-kill:
+            проверьте docker stats и лимиты контейнеров.

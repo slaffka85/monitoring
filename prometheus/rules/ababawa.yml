@@ -1,0 +1,148 @@
+# =============================================================================
+# Алерты проекта ababawa (Java API + PostgreSQL + TURN).
+#
+# Доступность целей проверяется общим правилом TargetDown (rules/platform.yml).
+# Здесь — то, что видно только по внутренним метрикам: деградация API, давление
+# на JVM и базу.
+#
+# Метки api/postgres/turn и project приходят из prometheus/targets/*/ababawa.yml.
+# =============================================================================
+groups:
+  - name: ababawa
+    rules:
+      - alert: AbabawaApiErrorRateHigh
+        expr: >-
+          sum(rate(http_server_requests_seconds_count{job="api",project="ababawa",status=~"5.."}[5m]))
+          / clamp_min(sum(rate(http_server_requests_seconds_count{job="api",project="ababawa"}[5m])), 1e-9)
+          > 0.05
+        for: 10m
+        labels:
+          project: ababawa
+          severity: critical
+        annotations:
+          summary: "ababawa API: более 5% ответов с ошибкой 5xx"
+          description: >-
+            Доля 5xx за 5 минут — {{ $value | humanizePercentage }}.
+            Смотрите логи api: docker logs --tail=200 abavava-api-1
+            и Grafana-панель «Ошибки по эндпоинтам».
+
+      - alert: AbabawaApiLatencyHigh
+        expr: >-
+          histogram_quantile(0.95,
+            sum by (le) (
+              rate(http_server_requests_seconds_bucket{job="api",project="ababawa"}[5m])
+            )
+          ) > 1
+        for: 10m
+        labels:
+          project: ababawa
+          severity: warning
+        annotations:
+          summary: "ababawa API: p95 задержки выше 1 с"
+          description: >-
+            p95 за 5 минут — {{ $value | humanize_duration }}. Типовые причины:
+            медленные запросы к PostgreSQL, нехватка CPU, GC-паузы.
+
+      - alert: AbabawaJvmHeapHigh
+        expr: >-
+          sum(jvm_memory_used_bytes{job="api",project="ababawa",area="heap"})
+          / clamp_min(sum(jvm_memory_max_bytes{job="api",project="ababawa",area="heap"}), 1)
+          > 0.9
+        for: 10m
+        labels:
+          project: ababawa
+          severity: warning
+        annotations:
+          summary: "ababawa API: heap занят более чем на 90%"
+          description: >-
+            Занято {{ $value | humanizePercentage }} heap. Если растёт постоянно —
+            утечка или мало памяти контейнеру; если пилообразно — нормальная
+            работа GC.
+
+      - alert: AbabawaJvmGcPauseHigh
+        expr: >-
+          sum(rate(jvm_gc_pause_seconds_sum{job="api",project="ababawa"}[5m]))
+          / clamp_min(sum(rate(jvm_gc_pause_seconds_count{job="api",project="ababawa"}[5m])), 1e-9)
+          > 0.5
+        for: 15m
+        labels:
+          project: ababawa
+          severity: warning
+        annotations:
+          summary: "ababawa API: средняя пауза GC выше 0,5 с"
+          description: >-
+            Средняя пауза — {{ $value | humanize_duration }}. Такие паузы заметны
+            пользователю (подвисания чата и WebSocket).
+
+      - alert: AbabawaDbDown
+        expr: pg_up{job="postgres",project="ababawa"} == 0
+        for: 2m
+        labels:
+          project: ababawa
+          severity: critical
+        annotations:
+          summary: "ababawa: PostgreSQL недоступен для экспортёра"
+          description: >-
+            postgres_exporter не может подключиться к базе (pg_up=0). Контейнер
+            postgres мог упасть или исчерпан лимит соединений.
+
+      - alert: AbabawaDbConnectionsHigh
+        expr: >-
+          sum by (project) (pg_stat_database_numbackends{job="postgres",project="ababawa",datname="abavava"})
+          / on(project) group_left
+          max by (project) (pg_settings_max_connections{job="postgres",project="ababawa"})
+          > 0.8
+        for: 10m
+        labels:
+          project: ababawa
+          severity: warning
+        annotations:
+          summary: "ababawa: занято более 80% соединений PostgreSQL"
+          description: >-
+            Занято {{ $value | humanizePercentage }} max_connections. Дальше —
+            «too many clients already» и полный отказ API. Проверьте пул
+            приложения: hikaricp_connections_active / hikaricp_connections_max.
+
+      - alert: AbabawaDbLongTransaction
+        expr: >-
+          max by (project) (pg_stat_activity_max_tx_duration{job="postgres",project="ababawa"}) > 600
+        for: 5m
+        labels:
+          project: ababawa
+          severity: warning
+        annotations:
+          summary: "ababawa: транзакция длится больше 10 минут"
+          description: >-
+            Самая долгая транзакция — {{ $value | humanize_duration }}. Такая
+            транзакция держит bloat, мешает VACUUM и может блокировать записи.
+
+      - alert: AbabawaDbDeadlocks
+        expr: >-
+          increase(pg_stat_database_deadlocks{job="postgres",project="ababawa",datname="abavava"}[15m]) > 0
+        for: 5m
+        labels:
+          project: ababawa
+          severity: warning
+        annotations:
+          summary: "ababawa: обнаружены взаимоблокировки в PostgreSQL"
+          description: >-
+            За 15 минут зафиксировано {{ $value }} deadlock-ов. Часть операций
+            пользователей гарантированно завершилась ошибкой.
+
+      # Видеозвонки: клиент не смог авторизоваться на TURN. Метрика снимается с
+      # coturn уже на этапе ALLOCATE, поэтому срабатывает раньше, чем жалобы
+      # «звонок не соединяется».
+      - alert: AbabawaTurnAuthFailures
+        expr: >-
+          sum(rate(turn_auth_credential_failures{job="turn",project="ababawa",cause=~"expired|integrity_mismatch"}[5m])) > 0.2
+        for: 10m
+        labels:
+          project: ababawa
+          severity: warning
+        annotations:
+          summary: "ababawa: TURN отклоняет креденшелы клиентов"
+          description: >-
+            {{ $value }} отказов в секунду по причине expired (истёк TTL временных
+            креденшелов) или integrity_mismatch (неверный секрет). Симптом —
+            звонки «идут», но медиа не устанавливается. Проверьте
+            GET /api/v1/config/ice и TURN_URL/TURN_USERNAME/TURN_CREDENTIAL.

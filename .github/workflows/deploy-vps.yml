@@ -1,0 +1,166 @@
+name: Validate and deploy to VPS
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monitoring-deploy
+  cancel-in-progress: false
+
+env:
+  PROMETHEUS_VERSION: v3.16.0
+
+jobs:
+  # Проверки без доступа к секретам: ловят битый YAML и ошибки в PromQL до того,
+  # как конфиг попадёт на VPS. promtool — единственный способ проверить правила
+  # по-настоящему, поэтому он запускается из того же образа, что и в проде.
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Create throwaway .env for compose validation
+        run: |
+          cp .env.example .env
+          sed -i 's|^GRAFANA_ADMIN_PASSWORD=$|GRAFANA_ADMIN_PASSWORD=ci-dummy|' .env
+          sed -i 's|^ABABAWA_DB_MONITOR_PASSWORD=$|ABABAWA_DB_MONITOR_PASSWORD=ci-dummy|' .env
+
+      - name: Validate compose file
+        run: docker compose config --quiet
+
+      - name: Validate Prometheus config
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/prometheus:/etc/prometheus:ro" \
+            "prom/prometheus:${PROMETHEUS_VERSION}" \
+            check config /etc/prometheus/prometheus.yml
+
+      - name: Validate alert rules
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/prometheus/rules:/rules:ro" \
+            "prom/prometheus:${PROMETHEUS_VERSION}" \
+            check rules /rules/platform.yml /rules/ababawa.yml
+
+      - name: Validate Alertmanager config
+        run: |
+          docker run --rm \
+            -v "$PWD/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro" \
+            --entrypoint amtool prom/alertmanager:v0.35.0 \
+            check-config /etc/alertmanager/alertmanager.yml
+
+      - name: Validate Grafana dashboard JSON
+        run: |
+          for f in grafana/dashboards/*.json; do
+            python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$f"
+            echo "ok $f"
+          done
+
+  deploy:
+    needs: validate
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install SSH credentials
+        env:
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Ensure target directory on VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes "$VPS_USER@$VPS_HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          if [ ! -d /opt/monitoring ]; then
+            # /opt принадлежит root: деплой-пользователь может создать каталог,
+            # только если админ заранее выдал права (см. docs/DEPLOY.md).
+            install -d -m 0755 /opt/monitoring 2>/dev/null || {
+              echo 'Каталог /opt/monitoring отсутствует. Создайте его один раз от root:' >&2
+              echo "  sudo install -d -o $USER -g $USER -m 0755 /opt/monitoring" >&2
+              exit 1
+            }
+          fi
+          test -w /opt/monitoring
+          REMOTE
+
+      - name: Copy stack files
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          # Каталоги конфигов заменяются целиком: иначе удалённое в Git правило
+          # осталось бы на VPS и продолжало срабатывать. .env не затрагивается.
+          tar -czf - compose.yaml prometheus alertmanager grafana postgres \
+            | ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
+              'set -e; cd /opt/monitoring && rm -rf prometheus alertmanager grafana postgres && tar -xzf -'
+
+      - name: Write .env on VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          GRAFANA_ADMIN_USER: ${{ vars.GRAFANA_ADMIN_USER || 'admin' }}
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+          GRAFANA_ROOT_URL: ${{ vars.GRAFANA_ROOT_URL || 'http://127.0.0.1:3001' }}
+          ABABAWA_DB_MONITOR_USER: ${{ vars.ABABAWA_DB_MONITOR_USER || 'abv_monitor' }}
+          ABABAWA_DB_MONITOR_PASSWORD: ${{ secrets.ABABAWA_DB_MONITOR_PASSWORD }}
+          ABABAWA_DOCKER_NETWORK: ${{ vars.ABABAWA_DOCKER_NETWORK || 'abavava_default' }}
+        run: |
+          printf '%s\n' \
+            "GRAFANA_ADMIN_USER=$GRAFANA_ADMIN_USER" \
+            "GRAFANA_ADMIN_PASSWORD=$GRAFANA_ADMIN_PASSWORD" \
+            "GRAFANA_ROOT_URL=$GRAFANA_ROOT_URL" \
+            "ABABAWA_DB_MONITOR_USER=$ABABAWA_DB_MONITOR_USER" \
+            "ABABAWA_DB_MONITOR_PASSWORD=$ABABAWA_DB_MONITOR_PASSWORD" \
+            "ABABAWA_DB_NAME=abavava" \
+            "ABABAWA_DOCKER_NETWORK=$ABABAWA_DOCKER_NETWORK" \
+            | ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
+              'umask 077; cat > /opt/monitoring/.env'
+
+      - name: Pull images and start stack
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          # --force-recreate: конфиги смонтированы bind-mount'ом, и Prometheus
+          # читает их только при старте/reload, поэтому без пересоздания свежие
+          # правила и targets не применились бы.
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
+            'cd /opt/monitoring && docker compose pull && docker compose up -d --remove-orphans --force-recreate'
+
+      - name: Verify Prometheus and Grafana are up
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes "$VPS_USER@$VPS_HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          for attempt in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:9090/-/ready >/dev/null 2>&1 \
+               && curl -fsS http://127.0.0.1:3001/api/health >/dev/null 2>&1; then
+              echo 'Prometheus и Grafana готовы.'
+              cd /opt/monitoring && docker compose ps
+              exit 0
+            fi
+            sleep 2
+          done
+          cd /opt/monitoring
+          docker compose ps >&2 || true
+          docker compose logs --tail=40 prometheus grafana >&2 || true
+          exit 1
+          REMOTE

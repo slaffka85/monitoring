@@ -1,0 +1,117 @@
+# =============================================================================
+# Конфигурация Prometheus стека monitoring.
+#
+# Модель «много проектов»:
+#   * инфраструктурные джобы (prometheus, node, cadvisor) — статические;
+#   * джобы проектов (api, postgres, turn) — file_sd: цели и метки лежат в
+#     prometheus/targets/<компонент>/<проект>.yml и перечитываются автоматически
+#     (refresh_interval), без перезапуска Prometheus.
+#
+# Подключить следующий проект = добавить файл(ы) в targets/ (+ при необходимости
+# контейнер экспортёра в compose.yaml). Джобы при этом менять не нужно.
+# Инструкция: docs/ADD-PROJECT.md.
+# =============================================================================
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    # Попадает в каждый ряд: по этим меткам видно, чьи данные (стенд/площадка).
+    stack: monitoring
+    site: vps
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - api_version: v2
+      static_configs:
+        - targets:
+            - 127.0.0.1:9093
+
+scrape_configs:
+  # --- Сам стек --------------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - 127.0.0.1:9090
+        labels:
+          component: prometheus
+
+  - job_name: alertmanager
+    scrape_interval: 30s
+    static_configs:
+      - targets:
+          - 127.0.0.1:9093
+        labels:
+          component: alertmanager
+
+  # --- Хост VPS --------------------------------------------------------------
+  - job_name: node
+    scrape_interval: 30s
+    static_configs:
+      - targets:
+          - 127.0.0.1:9100
+        labels:
+          component: host
+
+  # --- Контейнеры ------------------------------------------------------------
+  - job_name: cadvisor
+    scrape_interval: 30s
+    static_configs:
+      - targets:
+          - 127.0.0.1:8088
+        labels:
+          component: container
+
+  # --- Проект ababawa (ранее abavava) ----------------------------------------
+  # Java API (Spring Boot Actuator + Micrometer). Порт 18082 — опубликованный на
+  # loopback порт контейнера api из /opt/abavava/compose.prod.yaml.
+  - job_name: api
+    metrics_path: /actuator/prometheus
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/targets/api/*.yml
+        refresh_interval: 1m
+
+  # postgres_exporter уже умеет в один инстанс на один сервер БД; для второй базы
+  # поднимается второй контейнер экспортёра со своим портом и файлом цели.
+  - job_name: postgres
+    scrape_interval: 30s
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/targets/postgres/*.yml
+        refresh_interval: 1m
+
+  # coturn отдаёт метрики на 127.0.0.1:9641/metrics только при флаге
+  # --prometheus. В текущем compose.prod.yaml abavava его нет, поэтому файл цели
+  # лежит заготовкой (targets/turn/ababawa.yml.example) и джоба просто не имеет
+  # целей — TargetDown по ней не срабатывает.
+  - job_name: turn
+    scrape_interval: 30s
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/targets/turn/*.yml
+        refresh_interval: 1m
+
+  # --- Заготовки на будущее --------------------------------------------------
+  # Внешние проверки (доступность домена, TLS-сертификат, редиректы) требуют
+  # blackbox_exporter: он ходит в сеть снаружи, поэтому видит то, чего не видит
+  # скрейп по loopback. Раскомментировать вместе с сервисом в compose.yaml.
+  #
+  # - job_name: blackbox
+  #   metrics_path: /probe
+  #   params:
+  #     module: [http_2xx]
+  #   file_sd_configs:
+  #     - files:
+  #         - /etc/prometheus/targets/probe/*.yml
+  #   relabel_configs:
+  #     - source_labels: [__address__]
+  #       target_label: __param_target
+  #     - source_labels: [__param_target]
+  #       target_label: instance
+  #     - target_label: __address__
+  #       replacement: 127.0.0.1:9115

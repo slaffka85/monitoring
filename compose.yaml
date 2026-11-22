@@ -1,0 +1,173 @@
+# =============================================================================
+# Стек мониторинга: Prometheus + Alertmanager + Grafana + экспортёры.
+#
+# Целевая площадка — Linux-VPS, где рядом (в /opt/abavava) работает прод
+# ababawa. Поэтому все сервисы используют network_mode: host и слушают ТОЛЬКО
+# loopback (127.0.0.1): снаружи Prometheus/Grafana доступны исключительно через
+# SSH-туннель, порты не публикуются в интерфейс и обходят UFW.
+#
+# Как это стыкуется с ababawa: приложение уже публикует API на
+# 127.0.0.1:18082, postgres — на 127.0.0.1:5432, coturn с --prometheus отдаёт
+# метрики на 127.0.0.1:9641. Prometheus скрейпит их прямо по loopback, поэтому
+# общая docker-сеть между проектами не нужна.
+#
+# Секреты (пароль Grafana, роль БД для экспортёра) — в .env, см. .env.example.
+# =============================================================================
+
+name: monitoring
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # --- Сбор и хранение метрик ------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    container_name: monitoring-prometheus
+    network_mode: host
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      # Потолок по диску: 15 дней для одного проекта — это десятки мегабайт,
+      # но лимит защищает VPS, если подключим ещё несколько проектов.
+      - --storage.tsdb.retention.size=2GB
+      - --web.listen-address=127.0.0.1:9090
+      # Нужен для POST /-/reload: правила и targets можно перечитывать без
+      # перезапуска контейнера.
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - ./prometheus/targets:/etc/prometheus/targets:ro
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+    depends_on:
+      - alertmanager
+    logging: *default-logging
+
+  # --- Доставка алертов ------------------------------------------------------
+  alertmanager:
+    image: prom/alertmanager:v0.35.0
+    container_name: monitoring-alertmanager
+    network_mode: host
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=127.0.0.1:9093
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    restart: unless-stopped
+    logging: *default-logging
+
+  # --- Панели ----------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:13.2.6
+    container_name: monitoring-grafana
+    network_mode: host
+    environment:
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_SERVER_HTTP_PORT: "3001"
+      # root_url нужен, чтобы ссылки в уведомлениях Grafana вели на туннель, а
+      # не на localhost сервера.
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://127.0.0.1:3001}
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_USERS_ALLOW_ORG_CREATE: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/ababawa-overview.json
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    logging: *default-logging
+
+  # --- Метрики хоста VPS (CPU, RAM, диск, сеть) ------------------------------
+  node-exporter:
+    image: prom/node-exporter:v1.13.1
+    container_name: monitoring-node-exporter
+    network_mode: host
+    pid: host
+    command:
+      - --path.rootfs=/host
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --web.listen-address=127.0.0.1:9100
+      # Давление на CPU/IO/memory (PSI): отличает «медленно, потому что ждём
+      # диск» от «медленно, потому что нет CPU».
+      - --collector.pressure
+    volumes:
+      - /:/host:ro,rslave
+    restart: unless-stopped
+    logging: *default-logging
+
+  # --- Метрики контейнеров (api, web, postgres) ------------------------------
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.61.1
+    container_name: monitoring-cadvisor
+    network_mode: host
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    command:
+      - --listen_ip=127.0.0.1
+      - --port=8088
+      # Реже опрос — меньше нагрузки на api и postgres в мелком VPS.
+      - --housekeeping_interval=30s
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    restart: unless-stopped
+    logging: *default-logging
+
+  # --- Метрики PostgreSQL ababawa --------------------------------------------
+  # Постгрес прод-стека намеренно НЕ публикует порт на хост (в
+  # /opt/abavava/compose.prod.yaml у сервиса postgres нет ports), поэтому
+  # подключаемся к нему изнутри docker-сети проекта: сеть abavava_default
+  # объявлена external. Снаружи экспортёр виден только на loopback хоста, чтобы
+  # Prometheus (host network) мог его скрейпить.
+  #
+  # Следствие: сеть должна существовать — monitoring поднимается ПОСЛЕ abavava.
+  # Имя сети = <project>_<network>; если проект переименуют, задайте
+  # ABABAWA_DOCKER_NETWORK в .env.
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.21.1
+    container_name: monitoring-postgres-exporter
+    networks:
+      - ababava
+    ports:
+      - "127.0.0.1:9187:9187"
+    environment:
+      # postgres — DNS-имя сервиса внутри сети abavava.
+      DATA_SOURCE_URI: postgresql://postgres:5432/${ABABAWA_DB_NAME:-abavava}?sslmode=disable
+      DATA_SOURCE_USER: ${ABABAWA_DB_MONITOR_USER:-abv_monitor}
+      DATA_SOURCE_PASS: ${ABABAWA_DB_MONITOR_PASSWORD:?Set ABABAWA_DB_MONITOR_PASSWORD in .env}
+      # Метрики всех баз на сервере, а не только той, что в DSN.
+      PG_EXPORTER_AUTO_DISCOVER_DATABASES: "true"
+    restart: unless-stopped
+    logging: *default-logging
+
+volumes:
+  prometheus_data:
+  alertmanager_data:
+  grafana_data:
+
+networks:
+  ababava:
+    external: true
+    name: ${ABABAWA_DOCKER_NETWORK:-abavava_default}

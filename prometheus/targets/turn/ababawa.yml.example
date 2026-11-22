@@ -1,0 +1,28 @@
+# ЗАГОТОВКА: переименуйте файл в ababawa.yml, чтобы включить метрики TURN.
+#
+# Почему выключено: в /opt/abavava/compose.prod.yaml у coturn НЕТ флага
+# --prometheus, поэтому порт 9641 никто не слушает и цель была бы всегда down
+# (алерт TargetDown по job="turn"). Prometheus читает только *.yml, так что
+# файл с расширением .example просто игнорируется.
+#
+# Как включить (нужен доступ к репозиторию abavava):
+#   1. в команду сервиса coturn добавить строку
+#          - --prometheus
+#      и, если сборка поддерживает флаг, ограничить адрес:
+#          - --prometheus-address=127.0.0.1
+#      (без этого coturn слушает 0.0.0.0:9641 — закройте порт файрволом);
+#   2. выкатить abavava и убедиться: curl -s http://127.0.0.1:9641/metrics | head
+#   3. переименовать этот файл в ababawa.yml
+#   4. Prometheus подхватит цель в течение минуты (file_sd), перезапуск не нужен.
+#
+# Метрики coturn (см. src/apps/relay/prom_server.c):
+#   turn_total_allocations{type,protocol,family} — живые аллокации (сессии)
+#   turn_packet_processed / turn_packet_dropped  — пакеты в реальном времени
+#   turn_total_traffic_rcvb/sentb                — байты ТОЛЬКО завершённых сессий
+#   turn_auth_credential_failures{cause}         — отказы аутентификации
+- targets:
+    - 127.0.0.1:9641
+  labels:
+    project: ababawa
+    component: turn
+    env: production
