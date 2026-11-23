@@ -217,7 +217,7 @@ curl -s http://127.0.0.1:9641/metrics | head -5
 sudo ufw deny 9641/tcp        # или правило в security group провайдера
 ```
 
-Либо (предпочтительнее) ограничить адрес в abavava — флаг поддержан в 4.19.2:
+Либо (предпочтительнее) ограничить адрес в ababawa — флаг поддержан в 4.19.2:
 
 ```yaml
 # compose.prod.yaml, сервис coturn, в command:
@@ -300,6 +300,8 @@ docker compose up -d --remove-orphans --force-recreate
 | `up{job="api"} = 0`, в `/targets` — 404 | на VPS старый образ ababawa без Actuator | шаг 5: закоммитить правки и дождаться деплоя |
 | `up{job="api"} = 0`, connection refused | api не слушает `127.0.0.1:18082` | `ss -ltnp` на VPS, `docker compose ps` в `/opt/abavava` |
 | `up{job="postgres"} = 0` | экспортёр не поднялся | `docker compose logs postgres-exporter`, пароль в `.env` |
+| в логах экспортёра `dsn="postgresql://...@postgresql://127.0.0.1:5432/..."`, `context deadline exceeded` | в `--datasource.uri` попала схема `postgresql://` — экспортёр добавляет её сам, хостом становится слово `postgresql` | оставить только `host:port/db?sslmode=disable` (как в `compose.yaml`) |
+| `ss -ltn` показывает `*:9187` вместо `127.0.0.1:9187` | в 0.21.x `PG_EXPORTER_WEB_LISTEN_ADDRESS` больше не поддерживается | задать `--web.listen-address=127.0.0.1:9187` в `command` (в 0.21.x настройки переезжают из env в флаги) |
 | `pg_up 0` при `up{job="postgres"} = 1` | экспортёр жив, но не подключается к БД | роль не создана (шаг 4); пароль в `.env` ≠ пароль роли; порт `5432` не опубликован в abavava |
 | `up{job="turn"} = 0` | coturn без `--prometheus` или занят 9641 | `ss -ltnp \| grep 9641`, `docker logs abavava-coturn-1 \| grep -i prometheus` |
 | Prometheus пишет `no files found matching` | каталог targets пуст или не смонтирован | проверить `docker compose config` и `/opt/monitoring/prometheus/targets/*/` |
