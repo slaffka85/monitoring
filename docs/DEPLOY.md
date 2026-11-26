@@ -176,6 +176,8 @@ cd /opt/monitoring
 docker compose ps                                  # все running
 
 curl -s http://127.0.0.1:9090/-/ready              # Prometheus Server is Ready.
+curl -s http://127.0.0.1:3100/ready                # ready
+curl -s http://127.0.0.1:12345/-/ready             # ready
 curl -s http://127.0.0.1:3001/api/health           # {"database":"ok",...}
 
 # цели: prometheus, alertmanager, node, cadvisor, postgres, turn, api
@@ -187,17 +189,22 @@ curl -s http://127.0.0.1:9090/api/v1/targets \
 
 curl -s 'http://127.0.0.1:9090/api/v1/label/project/values'   # ["ababawa"]
 curl -s http://127.0.0.1:9090/api/v1/rules | head -c 300      # правила загружены
+
+# логи: после первых записей в Loki появляется метка проекта
+curl -s http://127.0.0.1:3100/loki/api/v1/labels | head -c 300
 ```
 
 Чек-лист:
 
-- [ ] `docker compose ps` — 6 сервисов `running`
+- [ ] `docker compose ps` — 8 сервисов `running` (добавились `loki` и `alloy`)
 - [ ] цели `up`, кроме `api` (до шага 5)
 - [ ] `pg_up 1` на `127.0.0.1:9187/metrics`
 - [ ] `curl 127.0.0.1:18082/actuator/prometheus` отдаёт метрики
 - [ ] в Prometheus `/alerts` нет `TargetDown`
 - [ ] в Grafana открывается дашборд «ababawa / Overview» без ошибок запросов
 - [ ] панели «TURN: …» показывают данные (в проде уже есть `--prometheus`)
+- [ ] в Loki есть потоки `project="abavava"` (логи api/web/postgres/coturn)
+- [ ] дашборд «ababawa / Calls & Telemetry» показывает логи и события звонков
 
 ## Шаг 7. Проверить порт метрик TURN
 
@@ -267,11 +274,11 @@ git -C /path/to/monitoring revert <commit>     # или вернуть преж�
 git push                                        # CI разложит прежнюю версию
 ```
 
-Полный сброс данных (метрики и настройки Grafana):
+Полный сброс данных (метрики, логи и настройки Grafana):
 
 ```bash
 cd /opt/monitoring
-docker compose down -v        # ВНИМАНИЕ: удаляет prometheus/grafana/alertmanager volumes
+docker compose down -v        # ВНИМАНИЕ: удаляет prometheus/grafana/alertmanager/loki/alloy volumes
 docker compose up -d
 ```
 
@@ -279,13 +286,13 @@ docker compose up -d
 
 ```bash
 # локально
-tar -czf monitoring.tgz compose.yaml prometheus alertmanager grafana postgres
+tar -czf monitoring.tgz compose.yaml prometheus alertmanager grafana postgres loki alloy
 scp monitoring.tgz deploy@$VPS_HOST:/tmp/
 
 # на VPS
 ssh deploy@$VPS_HOST
 cd /opt/monitoring
-rm -rf prometheus alertmanager grafana postgres
+rm -rf prometheus alertmanager grafana postgres loki alloy
 tar -xzf /tmp/monitoring.tgz
 cp .env.example .env && chmod 600 .env
 $EDITOR .env                    # GRAFANA_ADMIN_PASSWORD, ABABAWA_DB_MONITOR_PASSWORD
@@ -310,14 +317,22 @@ docker compose up -d --remove-orphans --force-recreate
 | cAdvisor падает: `/dev/kmsg: no such file` | усечённое ядро VPS | убрать `devices:` из сервиса `cadvisor` в `compose.yaml` |
 | Grafana-volume: permission denied | том создан под root | `docker compose down`, `docker volume rm monitoring_grafana_data`, `up -d` |
 | Цель `up`, но панели пустые | метрики ещё не накопились (нужно 2+ скрейпа) | подождать 1–2 минуты, проверить запрос в `/graph` |
+| В Loki нет потоков ababava | Alloy не видит Docker или не может писать в Loki | `docker compose logs alloy`; проверить `/var/run/docker.sock:ro` и `curl 127.0.0.1:3100/ready` |
+| Alloy падает с `permission denied` на `docker.sock` | UID агента не в группе `docker` | сервис запускается с `user: "0:0"` (см. комментарий в `compose.yaml`) — не убирать |
+| Потоки есть, но `project` пустой | контейнер запущен не через compose (нет метки compose project) | фильтровать по `container=~"abavava-.*"`; для прод-стека поднимать через `compose.prod.yaml` |
+| `loki_data` растёт | ретеншен не применяется или его мало | `docker compose logs loki \| grep -i retention`, проверить `compactor.retention_enabled` и `limits_config.retention_period` |
+| Grafana: «Failed to load datasource Loki» | Loki не готов или датасорс не прошёл provisioning | `curl 127.0.0.1:3100/ready`, `docker compose logs grafana \| grep -i provision` |
 
 Полезное:
 
 ```bash
 docker compose logs -f --tail=100 prometheus     # ошибки скрейпа и reload
+docker compose logs -f --tail=100 alloy loki     # сбор и приём логов
 docker compose exec prometheus promtool check config /etc/prometheus/prometheus.yml
 docker compose exec prometheus sh -c 'promtool check rules /etc/prometheus/rules/*.yml'
 docker compose exec alertmanager amtool check-config /etc/alertmanager/alertmanager.yml
+docker compose exec loki loki -config.file=/etc/loki/loki-config.yaml -verify-config
+docker compose exec alloy alloy validate /etc/alloy/config.alloy
 ```
 
 Отдельно про панели API: если `up{job="api"}` есть, а панели «Запросы по

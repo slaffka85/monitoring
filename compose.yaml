@@ -1,5 +1,5 @@
 # =============================================================================
-# Стек мониторинга: Prometheus + Alertmanager + Grafana + экспортёры.
+# Стек мониторинга: Prometheus + Alertmanager + Grafana + Loki + экспортёры.
 #
 # Целевая площадка — Linux-VPS, где рядом (в /opt/abavava) работает прод
 # ababawa. Поэтому все сервисы используют network_mode: host и слушают ТОЛЬКО
@@ -10,6 +10,9 @@
 # 127.0.0.1:18082, postgres — на 127.0.0.1:5432, coturn с --prometheus отдаёт
 # метрики на 127.0.0.1:9641. Prometheus скрейпит их прямо по loopback, поэтому
 # общая docker-сеть между проектами не нужна.
+#
+# Логи собирает Alloy через Docker API (json-file) и отправляет в Loki на
+# 127.0.0.1:3100; Grafana читает и метрики, и логи по loopback.
 #
 # Секреты (пароль Grafana, роль БД для экспортёра) — в .env, см. .env.example.
 # =============================================================================
@@ -64,6 +67,43 @@ services:
     restart: unless-stopped
     logging: *default-logging
 
+  # --- Сбор логов -------------------------------------------------------------
+  # Хранилище логов: single binary + filesystem. Слушает 127.0.0.1:3100.
+  loki:
+    image: grafana/loki:3.7.10
+    container_name: monitoring-loki
+    network_mode: host
+    command:
+      - -config.file=/etc/loki/loki-config.yaml
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki_data:/loki
+    restart: unless-stopped
+    logging: *default-logging
+
+  # Агент сбора: читает Docker json-file логи через сокет и отправляет в Loki.
+  # user 0:0 нужен только из-за прав на /var/run/docker.sock: UID образа alloy
+  # не входит в группу docker на хосте. Агент не слушает ничего, кроме
+  # 127.0.0.1:12345 (UI/отладка), и пишет лишь в свой WAL и в Loki.
+  alloy:
+    image: grafana/alloy:v1.22.0
+    container_name: monitoring-alloy
+    network_mode: host
+    user: "0:0"
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --server.http.listen-addr=127.0.0.1:12345
+      - --storage.path=/var/lib/alloy/data
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy/data
+    restart: unless-stopped
+    depends_on:
+      - loki
+    logging: *default-logging
+
   # --- Панели ----------------------------------------------------------------
   grafana:
     image: grafana/grafana:13.2.6
@@ -92,6 +132,7 @@ services:
     restart: unless-stopped
     depends_on:
       - prometheus
+      - loki
     logging: *default-logging
 
   # --- Метрики хоста VPS (CPU, RAM, диск, сеть) ------------------------------
@@ -179,3 +220,5 @@ volumes:
   prometheus_data:
   alertmanager_data:
   grafana_data:
+  loki_data:
+  alloy_data:

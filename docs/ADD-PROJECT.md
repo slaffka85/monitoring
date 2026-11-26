@@ -7,7 +7,7 @@
 ## Соглашения
 
 * `project` — короткое имя проекта строчными буквами без пробелов (`ababawa`). Значение попадает в каждый ряд метрик,
-  в переменную дашборда и в алерты, поэтому его нельзя менять задним числом.
+  в переменную дашборда, в метки потоков Loki и в алерты, поэтому его нельзя менять задним числом.
 * `component` — что именно за цель: `api`, `web`, `postgres`, `turn`, `redis`,
   `probe` и т.п.
 * `env` — `production` / `staging` / `dev`.
@@ -126,6 +126,43 @@ docker run --rm --entrypoint promtool \
 
 `group_by: [project, alertname]` в Alertmanager разложит алерты по проектам
 автоматически.
+
+## Шаг 7. Логи
+
+Логи нового проекта не требуют файлов целей: Alloy находит контейнеры через
+Docker API и берёт `project`/`service` из меток compose. Достаточно, чтобы у
+сервисов оставался драйвер `json-file` (по умолчанию) и было задано имя
+compose-проекта:
+
+```yaml
+name: newproject
+```
+
+Тогда в Loki появятся потоки
+`{project="newproject", service="api", container="newproject-api-1"}`.
+Проверка:
+
+```bash
+curl -s http://127.0.0.1:3100/loki/api/v1/label/project/values
+# {"status":"success","data":["ababawa","newproject"]}
+```
+
+В Grafana: Explore → Loki → `{project="newproject"}`. Отдельный дашборд — это
+копия `grafana/dashboards/ababawa-calls.json` с другими `uid`/`title` и
+выражениями на `{project="newproject"}`; провайдер подхватывает все JSON
+каталога.
+
+Если контейнер запускается не через compose (у него нет compose-метки), добавьте
+в `alloy/config.alloy` правило, которое берёт проект из обычной Docker-метки:
+
+```alloy
+rule {
+  source_labels = ["__meta_docker_container_label_project"]
+  target_label  = "project"
+}
+```
+
+и подписывайте контейнер `--label project=newproject`.
 
 ## Ограничения, о которых стоит помнить
 

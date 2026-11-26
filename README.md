@@ -16,11 +16,13 @@ React-клиент, PostgreSQL и coturn для видеозвонков.
 | PostgreSQL | соединения и `max_connections`, размер БД, commit/rollback в секунду, buffer cache hit, долгие транзакции, блокировки, deadlock-и | `postgres-exporter` на `127.0.0.1:9187`, БД — через опубликованный на loopback `127.0.0.1:5432` |
 | coturn (TURN) | живые аллокации (сессии) по протоколам, обработанные/отброшенные пакеты, байты завершённых сессий, отказы аутентификации | `127.0.0.1:9641/metrics` — в abavava coturn уже запущен с `--prometheus` (образ 4.19.2) |
 | Контейнеры | CPU и RAM по `abavava-api-1`, `-web-1`, `-postgres-1`, `-coturn-1` | `cAdvisor` на `127.0.0.1:8088` |
+| Логи всех контейнеров | stdout/stderr любого контейнера хоста: логи API, миграции, coturn, ошибки SMTP и NDJSON-телеметрия звонков | `Alloy` (`127.0.0.1:12345`) читает docker json-file логи через сокет и пишет в `Loki` (`127.0.0.1:3100`) |
 | Хост VPS | загрузка CPU, занятая RAM, место на `/`, PSI-давление на память | `node-exporter` на `127.0.0.1:9100` |
 | Сам стек | `up` по всем целям, скорость вычисления правил, успешность reload | Prometheus `127.0.0.1:9090` |
 
 Панели: дашборд **«ababawa / Overview»** (uid `ababawa-overview`) с переменной
-`project` — им же будут открываться следующие проекты.
+`project` — им же будут открываться следующие проекты. Логи и телеметрия
+звонков — дашборд **«ababawa / Calls & Telemetry»** (uid `ababawa-calls`).
 Алерты: `prometheus/rules/*.yml`, доставка через Alertmanager (`alertmanager/alertmanager.yml`).
 
 ## Как это устроено
@@ -33,7 +35,9 @@ VPS (Linux)
 └── /opt/monitoring       этот репозиторий
     ├── prometheus        :9090  ← скрейпит всё перечисленное по loopback
     ├── alertmanager      :9093
-    ├── grafana           :3001  ← панели
+    ├── grafana           :3001  ← панели (метрики + логи)
+    ├── loki              :3100  ← хранит логи 7 дней (filesystem)
+    ├── alloy             :12345 ← читает docker json-file логи → Loki
     ├── node-exporter     :9100
     ├── cadvisor          :8088
     └── postgres-exporter :9187
@@ -53,8 +57,14 @@ VPS (Linux)
   Grafana не даёт править их из UI (`allowUiUpdates: false`), так что «накрутил
   в интерфейсе и забыл» не случится.
 * **Версии образов запинены** (Prometheus 3.16.0, Grafana 13.2.6, Alertmanager
-  0.35.0, node-exporter 1.13.1, cAdvisor 0.61.1, postgres-exporter 0.21.1).
-  Обновление — отдельный осознанный шаг, а не сюрприз при `pull`.
+  0.35.0, Loki 3.7.10, Alloy 1.22.0, node-exporter 1.13.1, cAdvisor 0.61.1,
+  postgres-exporter 0.21.1). Обновление — отдельный осознанный шаг, а не сюрприз
+  при `pull`.
+* **Логи — через Alloy, а не Promtail.** Promtail снят с поддержки, поэтому
+  агент — Grafana Alloy: он читает docker json-file логи через API демона, знает
+  имя контейнера и compose-проект и переживает пересоздание контейнеров.
+  Loki хранит логи 7 дней на файловой системе — на маленьком VPS этого
+  достаточно, а ретеншен ограничивает диск.
 
 Одна оговорка про TURN: экспортёр coturn не подчиняется правилу «только
 loopback». По умолчанию (`--prometheus` без `--prometheus-address`) он слушает
@@ -97,7 +107,7 @@ sudo install -d -o deploy -g deploy -m 0755 /opt/monitoring
 локально одной командой:
 
 ```bash
-tar -czf - compose.yaml prometheus alertmanager grafana postgres \
+tar -czf - compose.yaml prometheus alertmanager grafana postgres loki alloy \
   | ssh deploy@<VPS_HOST> 'cd /opt/monitoring && tar -xzf -'
 ```
 
@@ -161,6 +171,29 @@ curl -s 'http://127.0.0.1:9090/api/v1/label/project/values'
 `job="api"` будет `down`, пока на VPS не поедет образ ababawa с включённым
 Actuator — это единственная цель, которая зависит от выкатки приложения.
 
+### 6. Проверка, что логи пошли
+
+```bash
+# Loki готов принимать запросы
+curl -fsS http://127.0.0.1:3100/ready && echo
+
+# какие метки уже есть (появятся после первых записей)
+curl -s http://127.0.0.1:3100/loki/api/v1/labels | head -c 500; echo
+
+# последние строки API: Loki слушает loopback хоста, curl с VPS достаточно
+curl -s 'http://127.0.0.1:3100/loki/api/v1/query_range?query=%7Bproject%3D%22abavava%22%7D&limit=5' \
+  | head -c 800; echo
+```
+
+Если потока `project="abavava"` так и нет:
+
+* `docker compose logs --tail=100 alloy` — доступ к `/var/run/docker.sock`
+  (Alloy запускается от root именно из-за прав на сокет);
+* `docker compose logs --tail=50 loki` — ошибки приёма и ретеншена;
+* у контейнеров ababawa должен оставаться драйвер `json-file`: он задан через
+  `x-logging` в `compose.prod.yaml`. Переключение на `journald` скроет логи от
+  Alloy.
+
 ## Что нужно со стороны ababawa
 
 Метрики приложения — это две правки в репозитории `abavava`:
@@ -169,6 +202,11 @@ Actuator — это единственная цель, которая завис
    (версии из BOM Spring Boot 4.1.2).
 2. `src/main/resources/application.yml` — секция `management`: открыты только
    `health` и `prometheus`, добавлена общая метка `application: ababawa`.
+
+Для логов правок в коде не нужно: приложение уже пишет в stdout, а телеметрия
+звонков — NDJSON. Важно только не менять драйвер логирования контейнеров с
+`json-file` (в `compose.prod.yaml` он закреплён через `x-logging` с ротацией),
+иначе Alloy перестанет их видеть.
 
 Эндпоинт `GET /actuator/prometheus` живёт на том же порту, что и API, и наружу
 не публикуется: Nginx проксирует только `/api/` (в api) и `/` (в web), а сам
@@ -210,12 +248,33 @@ ssh -N -L 3001:127.0.0.1:3001 deploy@<VPS_HOST>
 ssh -N -L 9090:127.0.0.1:9090 deploy@<VPS_HOST>
 # Alertmanager: http://127.0.0.1:9093
 ssh -N -L 9093:127.0.0.1:9093 deploy@<VPS_HOST>
+# Alloy UI (отладка сбора логов): http://127.0.0.1:12345
+ssh -N -L 12345:127.0.0.1:12345 deploy@<VPS_HOST>
 ```
 
 Логин в Grafana — `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` из `.env`.
 Если очень нужно открыть панели в интернет — делать это через тот же Nginx с
 TLS и basic-auth, а не публикацией порта: Prometheus и Alertmanager вообще не
 умеют аутентификацию.
+
+Логи и телеметрия звонков живут в Grafana: дашборд **ababawa / Calls & Telemetry**
+(ссылка есть в сайдбаре, uid `ababawa-calls`) и Explore с источником **Loki**.
+Отдельного web-UI у Loki нет — это сделано сознательно, чтобы не добавлять ещё
+один порт; запросы выполняет Grafana по loopback. Полезные запросы:
+
+```logql
+# все события телеметрии звонков
+{project="abavava", service="api"} | json | event != ""
+
+# один звонок по callId
+{project="abavava", service="api"} |= "<callId>"
+
+# исчерпанные ICE restart за сутки
+sum(count_over_time({project="abavava", service="api"} | json | event="ice_restart_exhausted" [24h]))
+
+# ошибки API
+{project="abavava", service="api"} |= "ERROR"
+```
 
 ## Алерты
 
@@ -244,12 +303,13 @@ webhook) — раскомментировать блок в `alertmanager/alertm
 `.github/workflows/deploy-vps.yml`:
 
 * **validate** (PR и push) — `docker compose config`, `promtool check config`,
-  `promtool check rules`, `amtool check-config`, проверка JSON дашбордов.
-  Правила проверяются тем же образом Prometheus, что и в проде;
+  `promtool check rules`, `amtool check-config`, `loki -verify-config`,
+  `alloy validate`, проверка JSON дашбордов. Правила и конфиги проверяются теми
+  же образами, что и в проде;
 * **deploy** (push в `main` и `workflow_dispatch`) — раскладывает файлы в
   `/opt/monitoring`, пишет `.env` из секретов, делает `pull` и пересоздаёт
-  контейнеры (`up -d --force-recreate`), затем проверяет, что Prometheus и
-  Grafana отвечают.
+  контейнеры (`up -d --force-recreate`), затем проверяет, что Prometheus, Loki,
+  Grafana и Alloy отвечают.
 
 Секреты репозитория: `VPS_HOST`, `VPS_USER`, `VPS_SSH_PRIVATE_KEY`,
 `VPS_KNOWN_HOSTS` (те же значения, что в репозитории abavava),
@@ -270,12 +330,21 @@ docker compose exec prometheus kill -HUP 1     # или POST /-/reload
 # targets подхватываются автоматически (file_sd, 1 минута)
 
 docker compose logs -f --tail=100 prometheus   # отладка скрейпа
+docker compose logs -f --tail=100 alloy loki   # отладка сбора логов
 docker compose ps                              # что упало
 ```
 
-* Ретеншен — 15 дней или 2 ГБ, что наступит раньше. Для истории за месяцы нужен
-  внешний remote-write, это отдельная задача.
-* Дашборд правится только через Git: `grafana/dashboards/*.json` →
+* Ретеншен метрик — 15 дней или 2 ГБ, что наступит раньше. Для истории за месяцы
+  нужен внешний remote-write, это отдельная задача.
+* Ретеншен логов — 7 дней (`limits_config.retention_period` в
+  `loki/loki-config.yaml`), удаляет compactor. Диск занимает только `loki_data`:
+  посмотреть объём — `docker system df -v | grep loki_data`, при нехватке места
+  уменьшить ретеншен или удалить старые чанки через compactor.
+* Alloy не хранит копию логов: только позиции чтения в `/var/lib/alloy/data`.
+  Пересоздание контейнера не приводит к повторной отправке всего объёма.
+  При самом первом запуске агент дочитывает текущие json-file логи (до 3 × 10 МБ
+  на контейнер) — это разовый всплеск, дальше он идёт по хвосту.
+* Дашборды правятся только через Git: `grafana/dashboards/*.json` →
   `docker compose restart grafana` (или подождать `updateIntervalSeconds: 30`).
 * Проверка перед пушем — локально тот же набор, что в CI:
   `docker compose config --quiet` и `docker run --rm --entrypoint promtool -v "$PWD/prometheus:/etc/prometheus:ro" prom/prometheus:v3.16.0 check config /etc/prometheus/prometheus.yml`
@@ -287,8 +356,12 @@ docker compose ps                              # что упало
 * **Внешние проверки (blackbox_exporter):** доступность `https://ababawa.tssv85.com`,
   срок TLS-сертификата, редиректы. Заготовка джобы уже лежит в
   `prometheus/prometheus.yml` — нужен сервис и файлы целей.
-* **Логи:** Loki + Promtail дали бы поиск по логам api рядом с метриками.
+* **Алерты по логам (Loki ruler):** сейчас логи только для разбора руками.
+  Можно добавить правило «ICE restart исчерпан» / «потери телеметрии» с отправкой
+  в тот же Alertmanager — нужен `ruler` в Loki и файл правил в Git.
 * **Бизнес-метрики ababawa:** сообщения/с, доставки, длительность и итог звонков,
   активные WebSocket-соединения. Требуют счётчиков в доменном коде приложения
   (пункт roadmap «Метрики Prometheus»), панели добавятся без изменений стека.
 * **Синтетика:** прогон `media:check` из CI как метрика «звонки работают».
+* **Трейсы:** OTel-экспорт из API в Tempo, если понадобится разбирать задержки
+  сквозь HTTP → БД → WebSocket.

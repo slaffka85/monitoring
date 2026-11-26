@@ -15,6 +15,9 @@ concurrency:
 
 env:
   PROMETHEUS_VERSION: v3.16.0
+  # Loki публикуется без префикса v (grafana/loki:3.7.10), Alloy — с ним.
+  LOKI_VERSION: "3.7.10"
+  ALLOY_VERSION: v1.22.0
 
 jobs:
   # Проверки без доступа к секретам: ловят битый YAML и ошибки в PromQL до того,
@@ -54,6 +57,20 @@ jobs:
             -v "$PWD/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro" \
             --entrypoint amtool prom/alertmanager:v0.35.0 \
             check-config /etc/alertmanager/alertmanager.yml
+
+      - name: Validate Loki config
+        run: |
+          docker run --rm \
+            -v "$PWD/loki:/etc/loki:ro" \
+            "grafana/loki:${LOKI_VERSION}" \
+            -config.file=/etc/loki/loki-config.yaml -verify-config
+
+      - name: Validate Alloy config
+        run: |
+          docker run --rm \
+            -v "$PWD/alloy:/etc/alloy:ro" \
+            "grafana/alloy:${ALLOY_VERSION}" \
+            validate /etc/alloy/config.alloy
 
       - name: Validate Grafana dashboard JSON
         run: |
@@ -106,9 +123,9 @@ jobs:
         run: |
           # Каталоги конфигов заменяются целиком: иначе удалённое в Git правило
           # осталось бы на VPS и продолжало срабатывать. .env не затрагивается.
-          tar -czf - compose.yaml prometheus alertmanager grafana postgres \
+          tar -czf - compose.yaml prometheus alertmanager grafana postgres loki alloy \
             | ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
-              'set -e; cd /opt/monitoring && rm -rf prometheus alertmanager grafana postgres && tar -xzf -'
+              'set -e; cd /opt/monitoring && rm -rf prometheus alertmanager grafana postgres loki alloy && tar -xzf -'
 
       - name: Write .env on VPS
         env:
@@ -143,7 +160,7 @@ jobs:
           ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
             'cd /opt/monitoring && docker compose pull && docker compose up -d --remove-orphans --force-recreate'
 
-      - name: Verify Prometheus and Grafana are up
+      - name: Verify Prometheus, Loki, Grafana and Alloy are up
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
@@ -152,8 +169,10 @@ jobs:
           set -euo pipefail
           for attempt in $(seq 1 45); do
             if curl -fsS http://127.0.0.1:9090/-/ready >/dev/null 2>&1 \
-               && curl -fsS http://127.0.0.1:3001/api/health >/dev/null 2>&1; then
-              echo 'Prometheus и Grafana готовы.'
+               && curl -fsS http://127.0.0.1:3100/ready >/dev/null 2>&1 \
+               && curl -fsS http://127.0.0.1:3001/api/health >/dev/null 2>&1 \
+               && curl -fsS http://127.0.0.1:12345/-/ready >/dev/null 2>&1; then
+              echo 'Prometheus, Loki, Grafana и Alloy готовы.'
               cd /opt/monitoring && docker compose ps
               exit 0
             fi
@@ -161,6 +180,6 @@ jobs:
           done
           cd /opt/monitoring
           docker compose ps >&2 || true
-          docker compose logs --tail=40 prometheus grafana >&2 || true
+          docker compose logs --tail=40 prometheus loki alloy grafana >&2 || true
           exit 1
           REMOTE
