@@ -1,0 +1,56 @@
+// =============================================================================
+// Grafana Alloy — единственный агент сбора логов стека monitoring.
+//
+// Источник — Docker (json-file). Alloy не парсит файлы на хосте, а спрашивает
+// Docker API: так он знает имя контейнера, compose-проект и сервис, корректно
+// переживает пересоздание контейнера и хранит позиции чтения в
+// /var/lib/alloy/data.
+//
+// Метки, по которым ищутся логи в Grafana:
+//   project="abavava"       — compose-проект (name: abavava в compose.prod.yaml)
+//   service="api"           — сервис внутри проекта
+//   container="abavava-api-1"
+//   job="docker", host="vps"
+//
+// Отправка — в Loki по loopback. Приложение ничего не знает про Alloy: оно
+// пишет NDJSON в stdout, а Alloy доставляет строку как есть.
+// =============================================================================
+
+discovery.docker "local" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "docker_logs" {
+  targets = discovery.docker.local.targets
+
+  // Docker отдаёт имя контейнера с ведущим слешем: "/abavava-api-1".
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "project"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+}
+
+loki.source.docker "containers" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.docker.local.targets
+  relabel_rules = discovery.relabel.docker_logs.rules
+  labels        = { "job" = "docker", "host" = "vps" }
+  forward_to    = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://127.0.0.1:3100/loki/api/v1/push"
+  }
+}

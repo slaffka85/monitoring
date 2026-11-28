@@ -1,0 +1,69 @@
+# =============================================================================
+# Loki 3.7 — хранилище логов стека monitoring.
+#
+# Single binary + filesystem: на маленьком VPS с одним проектом этого достаточно.
+# Кластерные режимы (отдельные distributor/ingester/querier) дали бы лишние
+# процессы и память, а выигрыш был бы заметен только на десятках ГБ в сутки.
+# Схема v13 + TSDB — актуальный формат индекса для Loki 3.x.
+#
+# Слушает только 127.0.0.1:3100, как и остальные сервисы стека: снаружи доступен
+# исключительно через SSH-туннель, Grafana ходит по loopback.
+#
+# Ретеншен — 7 дней (168h): логи нужны, чтобы разбирать недавние инциденты, а не
+# как вечный архив. Старые чанки удаляет compactor. Изменить срок — осознанная
+# правка этого файла (дашборды и правила тоже живут в Git).
+# =============================================================================
+
+auth_enabled: false
+
+server:
+  http_listen_address: 127.0.0.1
+  http_listen_port: 3100
+  grpc_listen_address: 127.0.0.1
+  grpc_listen_port: 9096
+  log_level: info
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  retention_period: 168h
+  # Строки старше ретеншена не принимаем: после долгого простоя агента они всё
+  # равно попали бы в удаляемые чанки и только мешали бы compactor'у.
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  allow_structured_metadata: true
+  # Потолок числа потоков: контейнеров немного, но защита от «взрыва» меток.
+  max_streams_per_user: 5000
+  # Пределы одного запроса из Grafana/Explore, чтобы тяжёлый поиск не съел VPS.
+  max_entries_limit_per_query: 5000
+  max_query_series: 5000
+
+compactor:
+  working_directory: /loki/compactor
+  # Без delete_request_store retention_enabled не работает на filesystem.
+  delete_request_store: filesystem
+  retention_enabled: true
+  compaction_interval: 10m
+
+analytics:
+  reporting_enabled: false

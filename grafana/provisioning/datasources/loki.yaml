@@ -1,0 +1,17 @@
+apiVersion: 1
+
+# Источник логов для дашбордов из grafana/dashboards (uid фиксирован: панели
+# ссылаются на него). Loki слушает только loopback и без аутентификации:
+# единственный потребитель — эта Grafana.
+datasources:
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://127.0.0.1:3100
+    editable: false
+    jsonData:
+      # Защита UI от «показать всё за всё время»: больше 1000 строк Explore и
+      # панели логов не тянут.
+      maxLines: 1000
+      timeout: 60

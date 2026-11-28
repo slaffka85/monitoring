@@ -121,11 +121,38 @@ jobs:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
         run: |
+          # pipefail обязателен: без него ошибка tar'а в конвейере не видна, а
+          # удалённый `rm -rf` успевает снести рабочие конфиги.
+          set -euo pipefail
           # Каталоги конфигов заменяются целиком: иначе удалённое в Git правило
           # осталось бы на VPS и продолжало срабатывать. .env не затрагивается.
-          tar -czf - compose.yaml prometheus alertmanager grafana postgres loki alloy \
-            | ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
-              'set -e; cd /opt/monitoring && rm -rf prometheus alertmanager grafana postgres loki alloy && tar -xzf -'
+          dirs='prometheus alertmanager grafana postgres loki alloy'
+          # Архив собирается локально ДО первого обращения к VPS. Если чего-то из
+          # перечисленного нет в репозитории (так случилось с loki/ и alloy/:
+          # они жили только в рабочей копии и никогда не коммитились), tar падает
+          # здесь и /opt/monitoring остаётся нетронутым. Иначе отсутствующий
+          # каталог молча пропускался, compose создавал на его месте пустой
+          # каталог вместо файла, и Loki падал с
+          # «loki-config.yaml does not exist, set config.file for custom config path».
+          tar -czf /tmp/monitoring-stack.tgz compose.yaml $dirs
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
+            "set -eu; cd /opt/monitoring && rm -rf $dirs && tar -xzf -" < /tmp/monitoring-stack.tgz
+          # Проверка, что на месте все файлы, которые монтируются bind-mount'ом:
+          # пропавший файл даёт не ошибку деплоя, а упавший контейнер.
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes "$VPS_USER@$VPS_HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/monitoring
+          for f in prometheus/prometheus.yml alertmanager/alertmanager.yml \
+                   loki/loki-config.yaml alloy/config.alloy \
+                   grafana/provisioning/datasources/prometheus.yaml \
+                   grafana/provisioning/datasources/loki.yaml; do
+            if [ ! -f "$f" ]; then
+              echo "Не доставлен файл конфигурации: $f" >&2
+              exit 1
+            fi
+          done
+          echo 'Все файлы конфигурации на месте.'
+          REMOTE
 
       - name: Write .env on VPS
         env:
