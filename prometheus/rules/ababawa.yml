@@ -146,3 +146,143 @@ groups:
             креденшелов) или integrity_mismatch (неверный секрет). Симптом —
             звонки «идут», но медиа не устанавливается. Проверьте
             GET /api/v1/config/ice и TURN_URL/TURN_USERNAME/TURN_CREDENTIAL.
+
+  # ---------------------------------------------------------------------------
+  # Бизнес- и abuse-метрики приложения (микрометр, префикс ababawa_).
+  #
+  # Источник — /actuator/prometheus (джоба api). В метках нет IP, email и id,
+  # поэтому алерты срабатывают на частоту событий, а не на конкретного
+  # пользователя: разбор инцидента — в Grafana (ababawa / Business & Abuse) и
+  # Loki. Алерты ничего не блокируют: rate limit и попытки OTP ограничивает
+  # приложение, человек/дежурный решает, что делать дальше.
+  # ---------------------------------------------------------------------------
+  - name: ababawa-business
+    rules:
+      - alert: AbabawaOtpRateLimitSpike
+        expr: >-
+          sum(rate(ababawa_auth_otp_requests_total{job="api",project="ababawa",reason="rate_limited"}[5m])) > 0.1
+        for: 10m
+        labels:
+          project: ababawa
+          severity: warning
+        annotations:
+          summary: "ababawa: частые отказы отправки OTP по лимитам"
+          description: >-
+            {{ $value }} отказов в секунду по причине rate_limited за 5 минут.
+            Причины: клиент долбит /auth/resend или /auth/send-code, либо
+            resend-cooldown/часовой лимит писем исчерпан. Смотрите панели
+            «OTP rate limit по назначению» и «Rate limit HTTP-фильтра по scope».
+
+      - alert: AbabawaOtpVerificationFailuresHigh
+        expr: >-
+          sum(rate(ababawa_auth_otp_verifications_total{job="api",project="ababawa",result="failure",reason="invalid_code"}[5m])) > 0.1
+        for: 10m
+        labels:
+          project: ababawa
+          severity: warning
+        annotations:
+          summary: "ababawa: массовые неверные коды подтверждения"
+          description: >-
+            {{ $value }} неверных кодов в секунду за 5 минут. Похоже на перебор
+            кода: у аккаунта остаётся max-attempts попыток, затем код гасится.
+            Проверьте рост rate_limited по IP в логах и панель «Неуспешные
+            проверки OTP по причине».
+
+      - alert: AbabawaLoginFailuresHigh
+        expr: >-
+          (
+            sum(rate(ababawa_auth_logins_total{job="api",project="ababawa",result="failure"}[5m])) > 0.05
+            and
+            sum(rate(ababawa_auth_logins_total{job="api",project="ababawa",result="failure"}[5m]))
+            / clamp_min(sum(rate(ababawa_auth_logins_total{job="api",project="ababawa"}[5m])), 1e-9) > 0.3
+          )
+        for: 10m
+        labels:
+          project: ababawa
+          severity: warning
+        annotations:
+          summary: "ababawa: массовые неуспешные попытки входа"
+          description: >-
+            Более 30% входов завершаются отказом ({{ $value | humanizePercentage }}
+            от всех попыток). Чаще всего это перебор паролей; проверьте причину
+            на панели «Неуспешные входы по причине» (invalid_credentials).
+
+      - alert: AbabawaAccessDeniedSpike
+        expr: >-
+          sum(rate(ababawa_security_access_denied_total{job="api",project="ababawa",reason="invalid_token"}[5m])) > 0.5
+        for: 5m
+        labels:
+          project: ababawa
+          severity: warning
+        annotations:
+          summary: "ababawa: всплеск отказов по невалидным токенам"
+          description: >-
+            {{ $value }} отказов в секунду на защищённых эндпоинтах и рукопожатии
+            WebSocket. Похоже на перебор/подбор access-токенов или сломанный
+            клиент, который не обновляет токен. Панель «Отказы доступа к
+            защищённым endpoint» покажет канал (http/websocket).
+
+      - alert: AbabawaTokenReuseDetected
+        expr: >-
+          sum(increase(ababawa_auth_refresh_total{job="api",project="ababawa",reason="token_reuse"}[10m])) > 0
+        labels:
+          project: ababawa
+          severity: warning
+        annotations:
+          summary: "ababawa: обнаружено повторное использование refresh-токена"
+          description: >-
+            За 10 минут зафиксировано {{ $value }} случаев token_reuse: отозванный
+            refresh-токен предъявили повторно. Приложение уже отозвало все сессии
+            пользователя; проверьте логи api по строке
+            «refresh token reuse detected».
+
+      - alert: AbabawaCallSetupSuccessLow
+        expr: >-
+          (
+            sum(rate(ababawa_calls_accepted_total{job="api",project="ababawa"}[15m]))
+            / clamp_min(sum(rate(ababawa_calls_initiated_total{job="api",project="ababawa"}[15m])), 1e-9) < 0.5
+            and
+            sum(increase(ababawa_calls_initiated_total{job="api",project="ababawa"}[15m])) > 5
+          )
+        for: 15m
+        labels:
+          project: ababawa
+          severity: warning
+        annotations:
+          summary: "ababawa: звонки редко принимаются (ниже 50%)"
+          description: >-
+            Меньше половины звонков доходят до accepted при заметном объёме
+            ({{ $value | humanizePercentage }}). Проверьте, доставляется ли
+            CALL_INCOMING (WebSocket/push), и панель «Итоги завершённых звонков»
+            (missed/rejected).
+
+      - alert: AbabawaSignalingErrorsHigh
+        expr: >-
+          sum(rate(ababawa_calls_signaling_total{job="api",project="ababawa",result="failure"}[5m])) > 0.2
+        for: 10m
+        labels:
+          project: ababawa
+          severity: warning
+        annotations:
+          summary: "ababawa: много ошибок WebRTC-сигналинга"
+          description: >-
+            {{ $value }} ошибок в секунду при пересылке offer/answer/candidate.
+            Частая причина peer_offline — второй участник отключился, но клиент
+            продолжает сигналить; call_finished — гонка после завершения звонка.
+            Детали по типам — на панели «Ошибки signaling по причине».
+
+      - alert: AbabawaMailDeliveryFailing
+        expr: >-
+          sum(rate(ababawa_mail_deliveries_total{job="api",project="ababawa",result="failure"}[5m])) > 0.1
+        for: 10m
+        labels:
+          project: ababawa
+          severity: warning
+        annotations:
+          summary: "ababawa: письма с кодом не доставляются по SMTP"
+          description: >-
+            {{ $value }} неудачных попыток доставки в секунду. Пользователи не
+            получают коды подтверждения и сброса пароля. Текст ошибки — в логе
+            api («mail delivery failed»), проверьте SMTP и SPF/DKIM/DMARC по
+            docs/DEPLOYMENT.md.
+

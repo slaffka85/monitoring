@@ -12,7 +12,7 @@ React-клиент, PostgreSQL и coturn для видеозвонков.
 
 | Источник | Что видно | Откуда данные |
 |---|---|---|
-| Java API ababawa | RPS, p95-задержка, доля 5xx, разбивка по статусам и эндпоинтам, JVM (heap, GC, потоки), пул HikariCP | `GET /actuator/prometheus` — Spring Boot Actuator + Micrometer, порт `127.0.0.1:18082` |
+| Java API ababawa | RPS, p95-задержка, доля 5xx, разбивка по статусам и эндпоинтам, JVM (heap, GC, потоки), пул HikariCP; бизнес-метрики `ababawa_*`: регистрации, OTP, входы, звонки и signaling, rate limit, отказы доступа, телеметрия и SMTP | `GET /actuator/prometheus` — Spring Boot Actuator + Micrometer, порт `127.0.0.1:18082` |
 | PostgreSQL | соединения и `max_connections`, размер БД, commit/rollback в секунду, buffer cache hit, долгие транзакции, блокировки, deadlock-и | `postgres-exporter` на `127.0.0.1:9187`, БД — через опубликованный на loopback `127.0.0.1:5432` |
 | coturn (TURN) | живые аллокации (сессии) по протоколам, обработанные/отброшенные пакеты, байты завершённых сессий, отказы аутентификации | `127.0.0.1:9641/metrics` — в abavava coturn уже запущен с `--prometheus` (образ 4.19.2) |
 | Контейнеры | CPU и RAM по `abavava-api-1`, `-web-1`, `-postgres-1`, `-coturn-1` | `cAdvisor` на `127.0.0.1:8088` |
@@ -23,7 +23,10 @@ React-клиент, PostgreSQL и coturn для видеозвонков.
 Панели: дашборд **«ababawa / Overview»** (uid `ababawa-overview`) с переменной
 `project` — им же будут открываться следующие проекты. Логи и телеметрия
 звонков — дашборд **«ababawa / Calls & Telemetry»** (uid `ababawa-calls`).
-Алерты: `prometheus/rules/*.yml`, доставка через Alertmanager (`alertmanager/alertmanager.yml`).
+Продукт и abuse — дашборд **«ababawa / Business & Abuse»** (uid
+`ababawa-business`): регистрации, OTP, входы, звонки, rate limit, отказы
+доступа, ошибки signaling. Алерты: `prometheus/rules/*.yml`, доставка через
+Alertmanager (`alertmanager/alertmanager.yml`).
 
 ## Как это устроено
 
@@ -196,12 +199,21 @@ curl -s 'http://127.0.0.1:3100/loki/api/v1/query_range?query=%7Bproject%3D%22aba
 
 ## Что нужно со стороны ababawa
 
-Метрики приложения — это две правки в репозитории `abavava`:
+Инфраструктурные метрики приложения — это две правки в репозитории `abavava`:
 
 1. `pom.xml` — `spring-boot-starter-actuator` и `micrometer-registry-prometheus`
    (версии из BOM Spring Boot 4.1.2).
 2. `src/main/resources/application.yml` — секция `management`: открыты только
-   `health` и `prometheus`, добавлена общая метка `application: ababawa`.
+   `health` и `prometheus`, добавлена общая метка `application: ababawa`,
+   включены гистограммы `http.server.requests` и `ababawa.calls.duration`.
+
+Бизнес-метрики (`ababawa_*`) живут в доменном коде: `observability.BusinessMetrics`
+вызывается из `AuthService`, `EmailVerificationService`, `PasswordResetService`,
+`VerificationMailer`, `SmtpMailSender`, `CallService`, `CallTelemetryService`,
+`AuthRateLimitFilter`, `AccessTokenFilter`, `WsAuthFilter`. Каталог метрик,
+правила меток, PromQL и модель доверия к `X-Forwarded-For` —
+`abavava/docs/METRICS.md`. Панели и алерты стека от этого не меняются: новые
+метрики подхватываются существующей джобой `api`.
 
 Для логов правок в коде не нужно: приложение уже пишет в stdout, а телеметрия
 звонков — NDJSON. Важно только не менять драйвер логирования контейнеров с
@@ -276,6 +288,75 @@ sum(count_over_time({project="abavava", service="api"} | json | event="ice_resta
 {project="abavava", service="api"} |= "ERROR"
 ```
 
+## Бизнес-метрики и abuse
+
+Приложение отдаёт вместе с HTTP/JVM-метриками бизнес-счётчики с префиксом
+`ababawa_` (Micrometer, код — `com.abavava.chat.observability.BusinessMetrics`).
+Источник и правила кардинальности описаны в репозитории abavava:
+`docs/METRICS.md`. Метки — только из закрытых наборов (`result`, `reason`,
+`purpose`, `kind`, `status`, `event`, `role`, `scope`, `channel`); IP, email,
+`userId`, `callId` и тексты ошибок в метки не попадают, поэтому число серий
+предсказуемо.
+
+| Метрика | Что показывает |
+|---|---|
+| `ababawa_auth_registration_total` | попытки регистрации (`result`, `reason`) |
+| `ababawa_auth_otp_requests_total` | запросы кода: `purpose`, отказы по лимитам/адресу |
+| `ababawa_auth_otp_emails_total` | письмо с кодом поставлено в очередь или нет |
+| `ababawa_auth_otp_verifications_total` | проверки кода и причины отказа |
+| `ababawa_auth_logins_total` / `ababawa_auth_refresh_total` | входы; `token_reuse` — кража сессии |
+| `ababawa_calls_start_total` / `_initiated_total` / `_accepted_total` / `_ended_total` | попытки, созданные, принятые и завершённые звонки |
+| `ababawa_calls_signaling_total` | пересылка offer/answer/candidate и отказы |
+| `ababawa_calls_media_connected_total` | клиент сообщил `connected` (недоверенная, см. ниже) |
+| `ababawa_calls_duration_seconds` | гистограмма длительности звонка |
+| `ababawa_security_rate_limited_total` / `_access_denied_total` | срабатывания rate limit и отказы доступа |
+| `ababawa_ws_connections` / `_online_users` | активные WebSocket-соединения и онлайн |
+| `ababawa_mail_deliveries_total` | ответ SMTP при фоновой отправке |
+
+Счётчик появляется в экспозиции с первым событием: пустая панель означает «ещё
+не было событий», а не поломку. Гаужи `ababawa_ws_*` есть всегда.
+
+Основные запросы панелей (полный список — в `grafana/dashboards/ababawa-business.json`):
+
+```promql
+# регистрации за час/период
+sum(increase(ababawa_auth_registration_total{job="api",project=~"$project",result="success"}[$__range]))
+
+# OTP в минуту по назначению
+sum by (purpose) (increase(ababawa_auth_otp_requests_total{job="api",project=~"$project"}[$__interval]))
+
+# доля неуспешных авторизаций
+100 * sum(rate(ababawa_auth_logins_total{job="api",project=~"$project",result="failure"}[5m]))
+    / clamp_min(sum(rate(ababawa_auth_logins_total{job="api",project=~"$project"}[5m])), 1e-9)
+
+# процент успешного установления звонков (signaling)
+100 * sum(increase(ababawa_calls_accepted_total{job="api",project=~"$project"}[$__range]))
+    / clamp_min(sum(increase(ababawa_calls_initiated_total{job="api",project=~"$project"}[$__range])), 1e-9)
+
+# частота подозрительных запросов: rate limit и отказы доступа
+sum by (scope) (rate(ababawa_security_rate_limited_total{job="api",project=~"$project"}[$__rate_interval]))
+sum by (channel, reason) (rate(ababawa_security_access_denied_total{job="api",project=~"$project"}[$__rate_interval]))
+
+# частота ошибок signaling
+sum by (event) (rate(ababawa_calls_signaling_total{job="api",project=~"$project",result="failure"}[$__rate_interval]))
+
+# p95 длительности звонка (нужна гистограмма из application.yml)
+histogram_quantile(0.95, sum by (le) (rate(ababawa_calls_duration_seconds_bucket{job="api",project=~"$project"}[$__rate_interval])))
+```
+
+Важные оговорки:
+
+* **Медиасоединение не выводится из signaling.** `calls_accepted_total` — это
+  «callee нажал принять», а не установленное соединение. Единственный признак
+  медиа — клиентское событие `ice_state_changed` с
+  `connection_state="connected"` (`ababawa_calls_media_connected_total`);
+  метрика недоверенная, считает переходы (после ICE restart их несколько) и
+  может превышать число звонков.
+* **IP в метках нет** — «запросы от одного IP» разбираются по логам (Loki), а
+  факт срабатывания лимита виден в `ababawa_security_rate_limited_total`.
+* **Ничего не блокируется автоматически.** Rate limit и лимиты OTP остаются в
+  приложении; новые метрики только для наблюдения.
+
 ## Алерты
 
 | Алерт | Смысл | Что делать |
@@ -290,6 +371,14 @@ sum(count_over_time({project="abavava", service="api"} | json | event="ice_resta
 | `AbabawaDbLongTransaction` | транзакция > 10 мин | `pg_stat_activity`, блокировки, bloat |
 | `AbabawaDbDeadlocks` | есть deadlock-и | искать в логах api пары операций, конфликтующих по строкам |
 | `AbabawaTurnAuthFailures` | TURN отклоняет креденшелы | `GET /api/v1/config/ice`, `ABV_TURN_*` в `/opt/abavava/.deploy.env`; симптом — звонок «идёт», медиа нет |
+| `AbabawaOtpRateLimitSpike` | частые отказы отправки OTP по лимитам | панели «OTP rate limit по назначению» и «Rate limit HTTP-фильтра по scope» |
+| `AbabawaOtpVerificationFailuresHigh` | массовые неверные коды (перебор) | «Неуспешные проверки OTP по причине», логи по IP |
+| `AbabawaLoginFailuresHigh` | >30% входов неуспешны | «Неуспешные входы по причине» (`invalid_credentials`) |
+| `AbabawaAccessDeniedSpike` | всплеск отказов по невалидным токенам | «Отказы доступа к защищённым endpoint» (`channel=http/websocket`) |
+| `AbabawaTokenReuseDetected` | отозванный refresh-токен предъявили снова | лог api «refresh token reuse detected», сессии уже отозваны |
+| `AbabawaCallSetupSuccessLow` | <50% звонков принимаются | доставка `CALL_INCOMING` (WebSocket/push), «Итоги завершённых звонков» |
+| `AbabawaSignalingErrorsHigh` | много ошибок WebRTC-сигналинга | «Ошибки signaling по причине» (`peer_offline`, `call_finished`) |
+| `AbabawaMailDeliveryFailing` | письма с кодом не доставляются | лог api «mail delivery failed», SMTP/SPF/DKIM/DMARC |
 | `HostDiskSpaceLow` | <15% на `/` | чистка образов (`docker image prune`), ретеншен Prometheus |
 | `HostMemoryPressureHigh` | PSI memory > 20% | `docker stats`; кандидат на OOM-kill |
 
@@ -359,9 +448,16 @@ docker compose ps                              # что упало
 * **Алерты по логам (Loki ruler):** сейчас логи только для разбора руками.
   Можно добавить правило «ICE restart исчерпан» / «потери телеметрии» с отправкой
   в тот же Alertmanager — нужен `ruler` в Loki и файл правил в Git.
-* **Бизнес-метрики ababawa:** сообщения/с, доставки, длительность и итог звонков,
-  активные WebSocket-соединения. Требуют счётчиков в доменном коде приложения
-  (пункт roadmap «Метрики Prometheus»), панели добавятся без изменений стека.
+* **Событие `media_established` от клиента:** сейчас медиасоединение считается по
+  переходам `ice_state_changed` (может быть несколько на звонок после ICE
+  restart). Одно событие на звонок дало бы точный процент установленных звонков.
+* **Лимит частоты signaling:** `CallService.signal` проверяет участие и статус
+  звонка, но не частоту кадров. Кандидат — token bucket на соединение/звонок с
+  меткой `reason="rate_limited"`; наблюдать уже есть чем
+  (`ababawa_calls_signaling_total`).
+* **Разбор по IP:** в Prometheus IP нет (запрещено кардинальностью). Частые
+  запросы с одного адреса ищутся в Loki по логам Nginx/API; если понадобится
+  регулярная аналитика — отдельный источник, а не метка в этих метриках.
 * **Синтетика:** прогон `media:check` из CI как метрика «звонки работают».
 * **Трейсы:** OTel-экспорт из API в Tempo, если понадобится разбирать задержки
   сквозь HTTP → БД → WebSocket.
